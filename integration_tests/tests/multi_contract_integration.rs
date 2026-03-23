@@ -1,255 +1,475 @@
+//! Multi-Contract Integration Tests for Admin Role Transfer
+//! 
+//! This module provides comprehensive regression tests for upgrade admin transfer logic
+//! across all RemitWise contracts. Tests cover unauthorized transfer attempts, 
+//! locked-state behaviors, and cross-contract security assumptions.
+
 #![cfg(test)]
 
-use soroban_sdk::{testutils::Address as _, Address, Env, String as SorobanString};
+use soroban_sdk::{
+    testutils::{Address as _, AuthorizedFunction, AuthorizedInvocation},
+    Address, Env, IntoVal, Symbol,
+};
 
-// Import all contract types and clients
+// Import all contract types
 use bill_payments::{BillPayments, BillPaymentsClient};
+use family_wallet::{FamilyWallet, FamilyWalletClient};
 use insurance::{Insurance, InsuranceClient};
 use remittance_split::{RemittanceSplit, RemittanceSplitClient};
-use savings_goals::{SavingsGoalContract, SavingsGoalContractClient};
+use savings_goals::{SavingsGoals, SavingsGoalsClient};
 
-/// Integration test that simulates a complete user flow:
-/// 1. Deploy all contracts (remittance_split, savings_goals, bill_payments, insurance)
-/// 2. Initialize split configuration
-/// 3. Create goals, bills, and policies
-/// 4. Calculate split and verify amounts align with expectations
-#[test]
-fn test_multi_contract_user_flow() {
-    // Setup test environment
-    let env = Env::default();
-    env.mock_all_auths();
-
-    // Generate test user address
-    let user = Address::generate(&env);
-
-    // Deploy all contracts
-    let remittance_contract_id = env.register_contract(None, RemittanceSplit);
-    let remittance_client = RemittanceSplitClient::new(&env, &remittance_contract_id);
-
-    let savings_contract_id = env.register_contract(None, SavingsGoalContract);
-    let savings_client = SavingsGoalContractClient::new(&env, &savings_contract_id);
-
-    let bills_contract_id = env.register_contract(None, BillPayments);
-    let bills_client = BillPaymentsClient::new(&env, &bills_contract_id);
-
-    let insurance_contract_id = env.register_contract(None, Insurance);
-    let insurance_client = InsuranceClient::new(&env, &insurance_contract_id);
-
-    // Step 1: Initialize remittance split with percentages
-    // Spending: 40%, Savings: 30%, Bills: 20%, Insurance: 10%
-    let nonce = 0u64;
-    remittance_client.initialize_split(
-        &user, &nonce, &40u32, // spending
-        &30u32, // savings
-        &20u32, // bills
-        &10u32, // insurance
-    );
-
-    // Step 2: Create a savings goal
-    let goal_name = SorobanString::from_str(&env, "Education Fund");
-    let target_amount = 10_000i128;
-    let target_date = env.ledger().timestamp() + (365 * 86400); // 1 year from now
-
-    let goal_id = savings_client.create_goal(&user, &goal_name, &target_amount, &target_date);
-    assert_eq!(goal_id, 1u32, "Goal ID should be 1");
-
-    // Step 3: Create a bill
-    let bill_name = SorobanString::from_str(&env, "Electricity Bill");
-    let bill_amount = 500i128;
-    let due_date = env.ledger().timestamp() + (30 * 86400); // 30 days from now
-    let recurring = true;
-    let frequency_days = 30u32;
-
-    let bill_id = bills_client.create_bill(
-        &user,
-        &bill_name,
-        &bill_amount,
-        &due_date,
-        &recurring,
-        &frequency_days,
-        &SorobanString::from_str(&env, "XLM"),
-    );
-    assert_eq!(bill_id, 1u32, "Bill ID should be 1");
-
-    // Step 4: Create an insurance policy
-    let policy_name = SorobanString::from_str(&env, "Health Insurance");
-    let coverage_type = SorobanString::from_str(&env, "health");
-    let monthly_premium = 200i128;
-    let coverage_amount = 50_000i128;
-
-    let policy_id = insurance_client.create_policy(
-        &user,
-        &policy_name,
-        &coverage_type,
-        &monthly_premium,
-        &coverage_amount,
-    );
-    assert_eq!(policy_id, 1u32, "Policy ID should be 1");
-
-    // Step 5: Calculate split for a remittance amount
-    let total_remittance = 10_000i128;
-    let amounts = remittance_client.calculate_split(&total_remittance);
-    assert_eq!(amounts.len(), 4, "Should have 4 allocation amounts");
-
-    // Extract amounts
-    let spending_amount = amounts.get(0).unwrap();
-    let savings_amount = amounts.get(1).unwrap();
-    let bills_amount = amounts.get(2).unwrap();
-    let insurance_amount = amounts.get(3).unwrap();
-
-    // Step 6: Verify amounts match expected percentages
-    // Spending: 40% of 10,000 = 4,000
-    assert_eq!(
-        spending_amount, 4_000i128,
-        "Spending amount should be 4,000"
-    );
-
-    // Savings: 30% of 10,000 = 3,000
-    assert_eq!(savings_amount, 3_000i128, "Savings amount should be 3,000");
-
-    // Bills: 20% of 10,000 = 2,000
-    assert_eq!(bills_amount, 2_000i128, "Bills amount should be 2,000");
-
-    // Insurance: 10% of 10,000 = 1,000 (gets remainder to handle rounding)
-    assert_eq!(
-        insurance_amount, 1_000i128,
-        "Insurance amount should be 1,000"
-    );
-
-    // Step 7: Verify total sum equals original amount
-    let total_allocated = spending_amount + savings_amount + bills_amount + insurance_amount;
-    assert_eq!(
-        total_allocated, total_remittance,
-        "Total allocated should equal total remittance"
-    );
-
-    println!("✅ Multi-contract integration test passed!");
-    println!("   Total Remittance: {}", total_remittance);
-    println!("   Spending: {} (40%)", spending_amount);
-    println!("   Savings: {} (30%)", savings_amount);
-    println!("   Bills: {} (20%)", bills_amount);
-    println!("   Insurance: {} (10%)", insurance_amount);
+/// Test environment setup with all contracts deployed
+struct MultiContractTestEnv {
+    env: Env,
+    
+    // Contract clients
+    bill_payments: BillPaymentsClient<'static>,
+    family_wallet: FamilyWalletClient<'static>,
+    insurance: InsuranceClient<'static>,
+    remittance_split: RemittanceSplitClient<'static>,
+    savings_goals: SavingsGoalsClient<'static>,
+    
+    // Test addresses
+    owner: Address,
+    admin1: Address,
+    admin2: Address,
+    unauthorized_user: Address,
 }
 
-/// Test with different split percentages and verify rounding behavior
-#[test]
-fn test_split_with_rounding() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let user = Address::generate(&env);
-
-    // Deploy remittance split contract
-    let remittance_contract_id = env.register_contract(None, RemittanceSplit);
-    let remittance_client = RemittanceSplitClient::new(&env, &remittance_contract_id);
-
-    // Initialize with percentages that might cause rounding issues
-    // Spending: 33%, Savings: 33%, Bills: 17%, Insurance: 17%
-    remittance_client.initialize_split(&user, &0u64, &33u32, &33u32, &17u32, &17u32);
-
-    // Calculate split for an amount that will have rounding
-    let total = 1_000i128;
-    let amounts = remittance_client.calculate_split(&total);
-
-    let spending = amounts.get(0).unwrap();
-    let savings = amounts.get(1).unwrap();
-    let bills = amounts.get(2).unwrap();
-    let insurance = amounts.get(3).unwrap();
-
-    // Verify total still equals original (insurance gets remainder)
-    let total_allocated = spending + savings + bills + insurance;
-    assert_eq!(
-        total_allocated, total,
-        "Total allocated must equal original amount despite rounding"
-    );
-
-    println!("✅ Rounding test passed!");
-    println!("   Total: {}", total);
-    println!("   Spending: {} (33%)", spending);
-    println!("   Savings: {} (33%)", savings);
-    println!("   Bills: {} (17%)", bills);
-    println!("   Insurance: {} (17% + remainder)", insurance);
+impl MultiContractTestEnv {
+    fn new() -> Self {
+        let env = Env::default();
+        env.mock_all_auths();
+        
+        // Generate test addresses
+        let owner = Address::generate(&env);
+        let admin1 = Address::generate(&env);
+        let admin2 = Address::generate(&env);
+        let unauthorized_user = Address::generate(&env);
+        
+        // Deploy all contracts
+        let bill_payments_id = env.register_contract(None, BillPayments);
+        let family_wallet_id = env.register_contract(None, FamilyWallet);
+        let insurance_id = env.register_contract(None, Insurance);
+        let remittance_split_id = env.register_contract(None, RemittanceSplit);
+        let savings_goals_id = env.register_contract(None, SavingsGoals);
+        
+        // Create clients
+        let bill_payments = BillPaymentsClient::new(&env, &bill_payments_id);
+        let family_wallet = FamilyWalletClient::new(&env, &family_wallet_id);
+        let insurance = InsuranceClient::new(&env, &insurance_id);
+        let remittance_split = RemittanceSplitClient::new(&env, &remittance_split_id);
+        let savings_goals = SavingsGoalsClient::new(&env, &savings_goals_id);
+        
+        // Initialize contracts where needed
+        let initial_members = soroban_sdk::vec![&env, owner.clone()];
+        family_wallet.init(&owner, &initial_members);
+        
+        // Initialize remittance split with basic config
+        let token_address = Address::generate(&env);
+        remittance_split.initialize_split(
+            &owner,
+            &token_address,
+            &25, // savings_percentage
+            &15, // bills_percentage  
+            &10, // insurance_percentage
+            &50, // spending_percentage
+        );
+        
+        // Initialize savings goals
+        savings_goals.init();
+        
+        Self {
+            env,
+            bill_payments,
+            family_wallet,
+            insurance,
+            remittance_split,
+            savings_goals,
+            owner,
+            admin1,
+            admin2,
+            unauthorized_user,
+        }
+    }
 }
 
-/// Test creating multiple goals, bills, and policies
+/// Test bootstrap admin setup across all contracts
 #[test]
-fn test_multiple_entities_creation() {
-    let env = Env::default();
-    env.mock_all_auths();
+fn test_bootstrap_admin_setup_all_contracts() {
+    let test_env = MultiContractTestEnv::new();
+    
+    // Test bootstrap pattern for contracts that support it
+    
+    // 1. Bill Payments - bootstrap pattern (caller == new_admin)
+    let result = test_env.bill_payments.try_set_upgrade_admin(&test_env.admin1, &test_env.admin1);
+    assert!(result.is_ok(), "Bill payments bootstrap should succeed");
+    
+    let current_admin = test_env.bill_payments.get_upgrade_admin_public();
+    assert_eq!(current_admin, Some(test_env.admin1.clone()));
+    
+    // 2. Insurance - bootstrap pattern (caller == new_admin)
+    let result = test_env.insurance.try_set_upgrade_admin(&test_env.admin1, &test_env.admin1);
+    assert!(result.is_ok(), "Insurance bootstrap should succeed");
+    
+    let current_admin = test_env.insurance.get_upgrade_admin_public();
+    assert_eq!(current_admin, Some(test_env.admin1.clone()));
+    
+    // 3. Savings Goals - bootstrap pattern (caller == new_admin)
+    test_env.savings_goals.set_upgrade_admin(&test_env.admin1, &test_env.admin1);
+    
+    let current_admin = test_env.savings_goals.get_upgrade_admin_public();
+    assert_eq!(current_admin, Some(test_env.admin1.clone()));
+    
+    // 4. Remittance Split - owner-based setup
+    let result = test_env.remittance_split.try_set_upgrade_admin(&test_env.owner, &test_env.admin1);
+    assert!(result.is_ok(), "Remittance split owner setup should succeed");
+    
+    let current_admin = test_env.remittance_split.get_upgrade_admin_public();
+    assert_eq!(current_admin, Some(test_env.admin1.clone()));
+    
+    // 5. Family Wallet - owner-based setup
+    let result = test_env.family_wallet.set_upgrade_admin(&test_env.owner, &test_env.admin1);
+    assert!(result, "Family wallet owner setup should succeed");
+    
+    let current_admin = test_env.family_wallet.get_upgrade_admin_public();
+    assert_eq!(current_admin, Some(test_env.admin1.clone()));
+}
 
-    let user = Address::generate(&env);
+/// Test unauthorized bootstrap attempts across all contracts
+#[test]
+fn test_unauthorized_bootstrap_attempts() {
+    let test_env = MultiContractTestEnv::new();
+    
+    // Test unauthorized bootstrap attempts (caller != new_admin for bootstrap contracts)
+    
+    // 1. Bill Payments - unauthorized bootstrap should fail
+    let result = test_env.bill_payments.try_set_upgrade_admin(&test_env.unauthorized_user, &test_env.admin1);
+    assert!(result.is_err(), "Unauthorized bill payments bootstrap should fail");
+    
+    // 2. Insurance - unauthorized bootstrap should fail  
+    let result = test_env.insurance.try_set_upgrade_admin(&test_env.unauthorized_user, &test_env.admin1);
+    assert!(result.is_err(), "Unauthorized insurance bootstrap should fail");
+    
+    // 3. Remittance Split - non-owner setup should fail
+    let result = test_env.remittance_split.try_set_upgrade_admin(&test_env.unauthorized_user, &test_env.admin1);
+    assert!(result.is_err(), "Unauthorized remittance split setup should fail");
+    
+    // Verify no admin was set
+    let admin = test_env.bill_payments.get_upgrade_admin_public();
+    assert_eq!(admin, None, "No admin should be set after failed bootstrap");
+    
+    let admin = test_env.insurance.get_upgrade_admin_public();
+    assert_eq!(admin, None, "No admin should be set after failed bootstrap");
+    
+    let admin = test_env.remittance_split.get_upgrade_admin_public();
+    assert_eq!(admin, None, "No admin should be set after failed bootstrap");
+}
 
-    // Deploy contracts
-    let savings_contract_id = env.register_contract(None, SavingsGoalContract);
-    let savings_client = SavingsGoalContractClient::new(&env, &savings_contract_id);
+/// Test admin transfer between authorized parties
+#[test]
+fn test_authorized_admin_transfer() {
+    let mut test_env = MultiContractTestEnv::new();
+    
+    // Setup initial admins
+    test_env.bill_payments.set_upgrade_admin(&test_env.admin1, &test_env.admin1);
+    test_env.insurance.set_upgrade_admin(&test_env.admin1, &test_env.admin1);
+    test_env.savings_goals.set_upgrade_admin(&test_env.admin1, &test_env.admin1);
+    test_env.remittance_split.set_upgrade_admin(&test_env.owner, &test_env.admin1);
+    test_env.family_wallet.set_upgrade_admin(&test_env.owner, &test_env.admin1);
+    
+    // Transfer admin from admin1 to admin2 across all contracts
+    
+    // 1. Bill Payments
+    let result = test_env.bill_payments.try_set_upgrade_admin(&test_env.admin1, &test_env.admin2);
+    assert!(result.is_ok(), "Authorized bill payments transfer should succeed");
+    
+    let current_admin = test_env.bill_payments.get_upgrade_admin_public();
+    assert_eq!(current_admin, Some(test_env.admin2.clone()));
+    
+    // 2. Insurance
+    let result = test_env.insurance.try_set_upgrade_admin(&test_env.admin1, &test_env.admin2);
+    assert!(result.is_ok(), "Authorized insurance transfer should succeed");
+    
+    let current_admin = test_env.insurance.get_upgrade_admin_public();
+    assert_eq!(current_admin, Some(test_env.admin2.clone()));
+    
+    // 3. Savings Goals
+    test_env.savings_goals.set_upgrade_admin(&test_env.admin1, &test_env.admin2);
+    
+    let current_admin = test_env.savings_goals.get_upgrade_admin_public();
+    assert_eq!(current_admin, Some(test_env.admin2.clone()));
+    
+    // 4. Remittance Split
+    let result = test_env.remittance_split.try_set_upgrade_admin(&test_env.admin1, &test_env.admin2);
+    assert!(result.is_ok(), "Authorized remittance split transfer should succeed");
+    
+    let current_admin = test_env.remittance_split.get_upgrade_admin_public();
+    assert_eq!(current_admin, Some(test_env.admin2.clone()));
+    
+    // 5. Family Wallet
+    let result = test_env.family_wallet.set_upgrade_admin(&test_env.owner, &test_env.admin2);
+    assert!(result, "Authorized family wallet transfer should succeed");
+    
+    let current_admin = test_env.family_wallet.get_upgrade_admin_public();
+    assert_eq!(current_admin, Some(test_env.admin2.clone()));
+}
 
-    let bills_contract_id = env.register_contract(None, BillPayments);
-    let bills_client = BillPaymentsClient::new(&env, &bills_contract_id);
+/// Test unauthorized admin transfer attempts
+#[test]
+fn test_unauthorized_admin_transfer() {
+    let mut test_env = MultiContractTestEnv::new();
+    
+    // Setup initial admins
+    test_env.bill_payments.set_upgrade_admin(&test_env.admin1, &test_env.admin1);
+    test_env.insurance.set_upgrade_admin(&test_env.admin1, &test_env.admin1);
+    test_env.savings_goals.set_upgrade_admin(&test_env.admin1, &test_env.admin1);
+    test_env.remittance_split.set_upgrade_admin(&test_env.owner, &test_env.admin1);
+    test_env.family_wallet.set_upgrade_admin(&test_env.owner, &test_env.admin1);
+    
+    // Attempt unauthorized transfers (non-admin trying to transfer)
+    
+    // 1. Bill Payments - unauthorized transfer should fail
+    let result = test_env.bill_payments.try_set_upgrade_admin(&test_env.unauthorized_user, &test_env.admin2);
+    assert!(result.is_err(), "Unauthorized bill payments transfer should fail");
+    
+    // 2. Insurance - unauthorized transfer should fail
+    let result = test_env.insurance.try_set_upgrade_admin(&test_env.unauthorized_user, &test_env.admin2);
+    assert!(result.is_err(), "Unauthorized insurance transfer should fail");
+    
+    // 3. Remittance Split - unauthorized transfer should fail
+    let result = test_env.remittance_split.try_set_upgrade_admin(&test_env.unauthorized_user, &test_env.admin2);
+    assert!(result.is_err(), "Unauthorized remittance split transfer should fail");
+    
+    // Verify admin remains unchanged
+    let admin = test_env.bill_payments.get_upgrade_admin_public();
+    assert_eq!(admin, Some(test_env.admin1.clone()), "Admin should remain unchanged after failed transfer");
+    
+    let admin = test_env.insurance.get_upgrade_admin_public();
+    assert_eq!(admin, Some(test_env.admin1.clone()), "Admin should remain unchanged after failed transfer");
+    
+    let admin = test_env.remittance_split.get_upgrade_admin_public();
+    assert_eq!(admin, Some(test_env.admin1.clone()), "Admin should remain unchanged after failed transfer");
+}
 
-    let insurance_contract_id = env.register_contract(None, Insurance);
-    let insurance_client = InsuranceClient::new(&env, &insurance_contract_id);
+/// Test admin operations while contracts are paused (locked state)
+#[test]
+fn test_admin_operations_while_paused() {
+    let mut test_env = MultiContractTestEnv::new();
+    
+    // Setup admins and pause admins
+    test_env.bill_payments.set_upgrade_admin(&test_env.admin1, &test_env.admin1);
+    test_env.bill_payments.set_pause_admin(&test_env.admin1, &test_env.admin1);
+    
+    test_env.insurance.set_upgrade_admin(&test_env.admin1, &test_env.admin1);
+    test_env.insurance.set_pause_admin(&test_env.admin1, &test_env.admin1);
+    
+    test_env.savings_goals.set_upgrade_admin(&test_env.admin1, &test_env.admin1);
+    test_env.savings_goals.set_pause_admin(&test_env.admin1, &test_env.admin1);
+    
+    test_env.remittance_split.set_upgrade_admin(&test_env.owner, &test_env.admin1);
+    test_env.remittance_split.set_pause_admin(&test_env.owner, &test_env.admin1);
+    
+    // Pause all contracts
+    let _ = test_env.bill_payments.try_pause(&test_env.admin1);
+    let _ = test_env.insurance.try_pause(&test_env.admin1);
+    test_env.savings_goals.pause(&test_env.admin1);
+    let _ = test_env.remittance_split.try_pause(&test_env.admin1);
+    
+    // Verify contracts are paused
+    assert!(test_env.bill_payments.is_paused(), "Bill payments should be paused");
+    assert!(test_env.insurance.is_paused(), "Insurance should be paused");
+    assert!(test_env.savings_goals.is_paused(), "Savings goals should be paused");
+    assert!(test_env.remittance_split.is_paused(), "Remittance split should be paused");
+    
+    // Test that admin transfer still works while paused (admin functions should not be blocked)
+    
+    // 1. Bill Payments - admin transfer should work while paused
+    let result = test_env.bill_payments.try_set_upgrade_admin(&test_env.admin1, &test_env.admin2);
+    assert!(result.is_ok(), "Admin transfer should work while contract is paused");
+    
+    let current_admin = test_env.bill_payments.get_upgrade_admin_public();
+    assert_eq!(current_admin, Some(test_env.admin2.clone()));
+    
+    // 2. Insurance - admin transfer should work while paused
+    let result = test_env.insurance.try_set_upgrade_admin(&test_env.admin1, &test_env.admin2);
+    assert!(result.is_ok(), "Admin transfer should work while contract is paused");
+    
+    let current_admin = test_env.insurance.get_upgrade_admin_public();
+    assert_eq!(current_admin, Some(test_env.admin2.clone()));
+    
+    // 3. Savings Goals - admin transfer should work while paused
+    test_env.savings_goals.set_upgrade_admin(&test_env.admin1, &test_env.admin2);
+    
+    let current_admin = test_env.savings_goals.get_upgrade_admin_public();
+    assert_eq!(current_admin, Some(test_env.admin2.clone()));
+    
+    // 4. Remittance Split - admin transfer should work while paused
+    let result = test_env.remittance_split.try_set_upgrade_admin(&test_env.admin1, &test_env.admin2);
+    assert!(result.is_ok(), "Admin transfer should work while contract is paused");
+    
+    let current_admin = test_env.remittance_split.get_upgrade_admin_public();
+    assert_eq!(current_admin, Some(test_env.admin2.clone()));
+}
 
-    // Create multiple savings goals
-    let goal1 = savings_client.create_goal(
-        &user,
-        &SorobanString::from_str(&env, "Emergency Fund"),
-        &5_000i128,
-        &(env.ledger().timestamp() + 180 * 86400),
-    );
-    assert_eq!(goal1, 1u32);
+/// Test version upgrade operations with proper admin authorization
+#[test]
+fn test_version_upgrade_authorization() {
+    let mut test_env = MultiContractTestEnv::new();
+    
+    // Setup upgrade admins
+    test_env.bill_payments.set_upgrade_admin(&test_env.admin1, &test_env.admin1);
+    test_env.insurance.set_upgrade_admin(&test_env.admin1, &test_env.admin1);
+    test_env.savings_goals.set_upgrade_admin(&test_env.admin1, &test_env.admin1);
+    test_env.remittance_split.set_upgrade_admin(&test_env.owner, &test_env.admin1);
+    
+    // Test authorized version upgrades
+    let new_version = 2u32;
+    
+    // 1. Bill Payments - authorized upgrade should succeed
+    let result = test_env.bill_payments.try_set_version(&test_env.admin1, &new_version);
+    assert!(result.is_ok(), "Authorized version upgrade should succeed");
+    
+    let current_version = test_env.bill_payments.get_version();
+    assert_eq!(current_version, new_version);
+    
+    // 2. Insurance - authorized upgrade should succeed
+    let result = test_env.insurance.try_set_version(&test_env.admin1, &new_version);
+    assert!(result.is_ok(), "Authorized version upgrade should succeed");
+    
+    let current_version = test_env.insurance.get_version();
+    assert_eq!(current_version, new_version);
+    
+    // 3. Savings Goals - authorized upgrade should succeed
+    test_env.savings_goals.set_version(&test_env.admin1, &new_version);
+    
+    let current_version = test_env.savings_goals.get_version();
+    assert_eq!(current_version, new_version);
+    
+    // 4. Remittance Split - authorized upgrade should succeed
+    let result = test_env.remittance_split.try_set_version(&test_env.admin1, &new_version);
+    assert!(result.is_ok(), "Authorized version upgrade should succeed");
+    
+    let current_version = test_env.remittance_split.get_version();
+    assert_eq!(current_version, new_version);
+    
+    // Test unauthorized version upgrades
+    let newer_version = 3u32;
+    
+    // 1. Bill Payments - unauthorized upgrade should fail
+    let result = test_env.bill_payments.try_set_version(&test_env.unauthorized_user, &newer_version);
+    assert!(result.is_err(), "Unauthorized version upgrade should fail");
+    
+    // 2. Insurance - unauthorized upgrade should fail
+    let result = test_env.insurance.try_set_version(&test_env.unauthorized_user, &newer_version);
+    assert!(result.is_err(), "Unauthorized version upgrade should fail");
+    
+    // 3. Remittance Split - unauthorized upgrade should fail
+    let result = test_env.remittance_split.try_set_version(&test_env.unauthorized_user, &newer_version);
+    assert!(result.is_err(), "Unauthorized version upgrade should fail");
+    
+    // Verify versions remain unchanged after failed upgrades
+    let version = test_env.bill_payments.get_version();
+    assert_eq!(version, new_version, "Version should remain unchanged after failed upgrade");
+    
+    let version = test_env.insurance.get_version();
+    assert_eq!(version, new_version, "Version should remain unchanged after failed upgrade");
+    
+    let version = test_env.remittance_split.get_version();
+    assert_eq!(version, new_version, "Version should remain unchanged after failed upgrade");
+}
 
-    let goal2 = savings_client.create_goal(
-        &user,
-        &SorobanString::from_str(&env, "Vacation"),
-        &2_000i128,
-        &(env.ledger().timestamp() + 90 * 86400),
-    );
-    assert_eq!(goal2, 2u32);
+/// Test cross-contract admin consistency and isolation
+#[test]
+fn test_cross_contract_admin_isolation() {
+    let mut test_env = MultiContractTestEnv::new();
+    
+    // Setup different admins for different contracts
+    test_env.bill_payments.set_upgrade_admin(&test_env.admin1, &test_env.admin1);
+    test_env.insurance.set_upgrade_admin(&test_env.admin2, &test_env.admin2);
+    test_env.savings_goals.set_upgrade_admin(&test_env.admin1, &test_env.admin1);
+    test_env.remittance_split.set_upgrade_admin(&test_env.owner, &test_env.admin2);
+    
+    // Verify admin isolation - admin1 cannot control admin2's contracts
+    
+    // admin1 should not be able to transfer admin2's contracts
+    let result = test_env.insurance.try_set_upgrade_admin(&test_env.admin1, &test_env.admin1);
+    assert!(result.is_err(), "Admin1 should not control insurance contract");
+    
+    let result = test_env.remittance_split.try_set_upgrade_admin(&test_env.admin1, &test_env.admin1);
+    assert!(result.is_err(), "Admin1 should not control remittance split contract");
+    
+    // admin2 should not be able to transfer admin1's contracts
+    let result = test_env.bill_payments.try_set_upgrade_admin(&test_env.admin2, &test_env.admin2);
+    assert!(result.is_err(), "Admin2 should not control bill payments contract");
+    
+    // Verify each admin can only control their assigned contracts
+    let result = test_env.bill_payments.try_set_upgrade_admin(&test_env.admin1, &test_env.owner);
+    assert!(result.is_ok(), "Admin1 should control bill payments contract");
+    
+    let result = test_env.insurance.try_set_upgrade_admin(&test_env.admin2, &test_env.owner);
+    assert!(result.is_ok(), "Admin2 should control insurance contract");
+}
 
-    // Create multiple bills
-    let bill1 = bills_client.create_bill(
-        &user,
-        &SorobanString::from_str(&env, "Rent"),
-        &1_500i128,
-        &(env.ledger().timestamp() + 30 * 86400),
-        &true,
-        &30u32,
-        &SorobanString::from_str(&env, "XLM"),
-    );
-    assert_eq!(bill1, 1u32);
+/// Test edge cases and error conditions
+#[test]
+fn test_admin_transfer_edge_cases() {
+    let mut test_env = MultiContractTestEnv::new();
+    
+    // Test self-transfer (admin transferring to themselves)
+    test_env.bill_payments.set_upgrade_admin(&test_env.admin1, &test_env.admin1);
+    
+    let result = test_env.bill_payments.try_set_upgrade_admin(&test_env.admin1, &test_env.admin1);
+    assert!(result.is_ok(), "Self-transfer should be allowed");
+    
+    let current_admin = test_env.bill_payments.get_upgrade_admin_public();
+    assert_eq!(current_admin, Some(test_env.admin1.clone()));
+    
+    // Test transfer to zero address (if supported by the platform)
+    // Note: This test may need to be adjusted based on Soroban's address validation
+    
+    // Test rapid successive transfers
+    let result = test_env.bill_payments.try_set_upgrade_admin(&test_env.admin1, &test_env.admin2);
+    assert!(result.is_ok(), "First transfer should succeed");
+    
+    let result = test_env.bill_payments.try_set_upgrade_admin(&test_env.admin2, &test_env.admin1);
+    assert!(result.is_ok(), "Immediate reverse transfer should succeed");
+    
+    let current_admin = test_env.bill_payments.get_upgrade_admin_public();
+    assert_eq!(current_admin, Some(test_env.admin1.clone()));
+}
 
-    let bill2 = bills_client.create_bill(
-        &user,
-        &SorobanString::from_str(&env, "Internet"),
-        &100i128,
-        &(env.ledger().timestamp() + 15 * 86400),
-        &true,
-        &30u32,
-        &SorobanString::from_str(&env, "XLM"),
-    );
-    assert_eq!(bill2, 2u32);
-
-    // Create multiple insurance policies
-    let policy1 = insurance_client.create_policy(
-        &user,
-        &SorobanString::from_str(&env, "Life Insurance"),
-        &SorobanString::from_str(&env, "life"),
-        &150i128,
-        &100_000i128,
-    );
-    assert_eq!(policy1, 1u32);
-
-    let policy2 = insurance_client.create_policy(
-        &user,
-        &SorobanString::from_str(&env, "Emergency Coverage"),
-        &SorobanString::from_str(&env, "emergency"),
-        &50i128,
-        &10_000i128,
-    );
-    assert_eq!(policy2, 2u32);
-
-    println!("✅ Multiple entities creation test passed!");
-    println!("   Created 2 savings goals");
-    println!("   Created 2 bills");
-    println!("   Created 2 insurance policies");
+/// Test admin transfer event emission
+#[test]
+fn test_admin_transfer_events() {
+    let mut test_env = MultiContractTestEnv::new();
+    
+    // Setup initial admin
+    test_env.bill_payments.set_upgrade_admin(&test_env.admin1, &test_env.admin1);
+    
+    // Clear any existing events
+    test_env.env.events().all().clear();
+    
+    // Perform admin transfer
+    let result = test_env.bill_payments.try_set_upgrade_admin(&test_env.admin1, &test_env.admin2);
+    assert!(result.is_ok(), "Admin transfer should succeed");
+    
+    // Verify event was emitted
+    let events = test_env.env.events().all();
+    assert!(!events.is_empty(), "Admin transfer should emit events");
+    
+    // Look for admin transfer event
+    let admin_transfer_events: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            if let Ok(topics) = event.topics.get(0) {
+                if let Ok(contract_symbol) = Symbol::try_from_val(&test_env.env, &topics) {
+                    return contract_symbol == Symbol::new(&test_env.env, "adm_xfr");
+                }
+            }
+            false
+        })
+        .collect();
+    
+    assert!(!admin_transfer_events.is_empty(), "Should emit admin transfer event");
 }

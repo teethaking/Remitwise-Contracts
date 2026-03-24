@@ -12,5 +12,5 @@ soroban-sdk = "21.0.0"
 [dev-dependencies]
 soroban-sdk = { version = "21.0.0", features = ["testutils"] }
 testutils = { path = "../testutils" }
-
+data_migration = { path = "../data_migration" }
 

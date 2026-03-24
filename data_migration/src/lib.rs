@@ -304,6 +304,33 @@ pub fn check_version_compatibility(version: u32) -> Result<(), MigrationError> {
     }
 }
 
+/// Build a fully-checksummed [`ExportSnapshot`] from a [`SavingsGoalsExport`] payload.
+///
+/// This is the canonical bridge between the on-chain `savings_goals` snapshot
+/// representation and the off-chain `data_migration` serialization layer.
+///
+/// # Arguments
+/// * `goals_export` – The savings goals payload to wrap.
+/// * `format`       – Target export format (JSON, Binary, CSV, Encrypted).
+///
+/// # Returns
+/// An [`ExportSnapshot`] with a valid header (version, format label) and a
+/// SHA-256 checksum computed over the canonical JSON of the payload.
+///
+/// # Security notes
+/// - The checksum is computed deterministically from the payload; callers must
+///   not mutate `header.checksum` after construction.
+/// - For `ExportFormat::Encrypted`, callers are responsible for encrypting the
+///   serialised bytes **after** calling this function and wrapping them via
+///   [`export_to_encrypted_payload`].
+pub fn build_savings_snapshot(
+    goals_export: SavingsGoalsExport,
+    format: ExportFormat,
+) -> ExportSnapshot {
+    let payload = SnapshotPayload::SavingsGoals(goals_export);
+    ExportSnapshot::new(payload, format)
+}
+
 /// Rollback metadata (for migration scripts to record last good state).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RollbackMetadata {
@@ -439,5 +466,441 @@ mod tests {
 
         let MigrationEvent::V1(v1) = loaded;
         assert_eq!(v1.version, SCHEMA_VERSION);
+    }
+
+    // =========================================================================
+    // End-to-end migration compatibility tests — savings snapshots
+    //
+    // These tests exercise the full export ↔ import roundtrip through
+    // data_migration for all four formats: JSON, Binary, CSV, Encrypted.
+    //
+    // Security assumptions validated:
+    //   - Checksum integrity: tampered payloads are rejected.
+    //   - Version gating: unsupported schema versions are rejected.
+    //   - Data fidelity: every field is preserved across the roundtrip.
+    // =========================================================================
+
+    /// Build a deterministic test payload (single goal).
+    fn make_single_goal_export() -> SavingsGoalsExport {
+        SavingsGoalsExport {
+            next_id: 2,
+            goals: vec![SavingsGoalExport {
+                id: 1,
+                owner: "GBSINGLE".into(),
+                name: "Emergency Fund".into(),
+                target_amount: 5_000_000,
+                current_amount: 2_500_000,
+                target_date: 2_000_000_000,
+                locked: false,
+            }],
+        }
+    }
+
+    /// Build a multi-goal payload (three goals).
+    fn make_multi_goal_export() -> SavingsGoalsExport {
+        SavingsGoalsExport {
+            next_id: 4,
+            goals: vec![
+                SavingsGoalExport {
+                    id: 1,
+                    owner: "GBOWNER_A".into(),
+                    name: "Vacation".into(),
+                    target_amount: 10_000,
+                    current_amount: 3_000,
+                    target_date: 1_900_000_000,
+                    locked: false,
+                },
+                SavingsGoalExport {
+                    id: 2,
+                    owner: "GBOWNER_A".into(),
+                    name: "Car".into(),
+                    target_amount: 50_000,
+                    current_amount: 50_000,
+                    target_date: 1_800_000_000,
+                    locked: true,
+                },
+                SavingsGoalExport {
+                    id: 3,
+                    owner: "GBOWNER_B".into(),
+                    name: "Education".into(),
+                    target_amount: 100_000,
+                    current_amount: 0,
+                    target_date: 2_100_000_000,
+                    locked: false,
+                },
+            ],
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // JSON format
+    // -------------------------------------------------------------------------
+
+    /// E2E: export savings goals snapshot to JSON, import back — all fields intact.
+    ///
+    /// Validates that the JSON serialization path preserves:
+    ///   - `next_id`, goal count, goal IDs, names, amounts, dates, `locked` flag.
+    ///   - Header version equals `SCHEMA_VERSION`.
+    ///   - Checksum is valid on the reimported snapshot.
+    #[test]
+    fn test_e2e_savings_snapshot_json_roundtrip() {
+        let export = make_single_goal_export();
+        let snapshot = build_savings_snapshot(export, ExportFormat::Json);
+
+        // Verify checksum on the freshly built snapshot.
+        assert!(snapshot.verify_checksum(), "checksum must be valid after build");
+        assert!(
+            snapshot.validate_for_import().is_ok(),
+            "snapshot must pass import validation"
+        );
+
+        // Serialize to JSON bytes.
+        let bytes = export_to_json(&snapshot).unwrap();
+        assert!(!bytes.is_empty(), "JSON bytes must be non-empty");
+
+        // Deserialize and validate.
+        let loaded = import_from_json(&bytes).unwrap();
+        assert_eq!(loaded.header.version, SCHEMA_VERSION);
+        assert_eq!(loaded.header.format, "json");
+        assert!(loaded.verify_checksum(), "reimported checksum must match");
+
+        // Check payload fidelity.
+        if let SnapshotPayload::SavingsGoals(ref goals_export) = loaded.payload {
+            assert_eq!(goals_export.next_id, 2);
+            assert_eq!(goals_export.goals.len(), 1);
+            let g = &goals_export.goals[0];
+            assert_eq!(g.id, 1);
+            assert_eq!(g.owner, "GBSINGLE");
+            assert_eq!(g.name, "Emergency Fund");
+            assert_eq!(g.target_amount, 5_000_000);
+            assert_eq!(g.current_amount, 2_500_000);
+            assert_eq!(g.target_date, 2_000_000_000);
+            assert!(!g.locked);
+        } else {
+            panic!("Expected SavingsGoals payload variant");
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Binary format
+    // -------------------------------------------------------------------------
+
+    /// E2E: export savings goals snapshot to binary (bincode), import back — checksum valid.
+    ///
+    /// Validates that the binary serialization path:
+    ///   - Produces a non-empty byte buffer.
+    ///   - Deserializes without error.
+    ///   - Checksum matches on the imported snapshot.
+    ///   - All goal fields survive intact.
+    #[test]
+    fn test_e2e_savings_snapshot_binary_roundtrip() {
+        let export = make_single_goal_export();
+        let snapshot = build_savings_snapshot(export, ExportFormat::Binary);
+
+        let bytes = export_to_binary(&snapshot).unwrap();
+        assert!(!bytes.is_empty(), "binary bytes must be non-empty");
+
+        let loaded = import_from_binary(&bytes).unwrap();
+        assert_eq!(loaded.header.version, SCHEMA_VERSION);
+        assert_eq!(loaded.header.format, "binary");
+        assert!(loaded.verify_checksum());
+
+        if let SnapshotPayload::SavingsGoals(ref goals_export) = loaded.payload {
+            assert_eq!(goals_export.goals.len(), 1);
+            assert_eq!(goals_export.goals[0].name, "Emergency Fund");
+            assert_eq!(goals_export.goals[0].target_amount, 5_000_000);
+        } else {
+            panic!("Expected SavingsGoals payload variant");
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // CSV format
+    // -------------------------------------------------------------------------
+
+    /// E2E: export savings goals to CSV, import back — all goal records intact.
+    ///
+    /// CSV export is a flat tabular format for spreadsheet compatibility.
+    /// Validates that each goal row round-trips its fields correctly.
+    #[test]
+    fn test_e2e_savings_snapshot_csv_roundtrip() {
+        let export = make_multi_goal_export();
+
+        // CSV export operates directly on the goals list.
+        let csv_bytes = export_to_csv(&export).unwrap();
+        assert!(!csv_bytes.is_empty());
+
+        let goals = import_goals_from_csv(&csv_bytes).unwrap();
+        assert_eq!(goals.len(), 3, "all three goals must survive CSV roundtrip");
+
+        // Verify each goal's data.
+        assert_eq!(goals[0].id, 1);
+        assert_eq!(goals[0].name, "Vacation");
+        assert_eq!(goals[0].target_amount, 10_000);
+        assert_eq!(goals[0].current_amount, 3_000);
+        assert!(!goals[0].locked);
+
+        assert_eq!(goals[1].id, 2);
+        assert_eq!(goals[1].name, "Car");
+        assert_eq!(goals[1].current_amount, 50_000);
+        assert!(goals[1].locked, "locked flag must be preserved in CSV");
+
+        assert_eq!(goals[2].id, 3);
+        assert_eq!(goals[2].owner, "GBOWNER_B");
+        assert_eq!(goals[2].name, "Education");
+        assert_eq!(goals[2].current_amount, 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // Encrypted format
+    // -------------------------------------------------------------------------
+
+    /// E2E: export savings goals to JSON, wrap in base64 (encrypted payload),
+    /// decode, then re-import — validates the full encrypted channel roundtrip.
+    ///
+    /// Security note: in production the caller encrypts the `plain_bytes` before
+    /// passing to `export_to_encrypted_payload`. This test validates the
+    /// encode/decode boundary; actual encryption is out-of-scope for the
+    /// migration utility layer.
+    #[test]
+    fn test_e2e_savings_snapshot_encrypted_roundtrip() {
+        let export = make_single_goal_export();
+        let snapshot = build_savings_snapshot(export, ExportFormat::Encrypted);
+        assert!(snapshot.verify_checksum());
+
+        // Serialize to JSON bytes first (the "plain" payload before encryption).
+        let plain_bytes = export_to_json(&snapshot).unwrap();
+
+        // Simulate encryption boundary: wrap in base64.
+        let encoded = export_to_encrypted_payload(&plain_bytes);
+        assert!(!encoded.is_empty(), "encoded payload must be non-empty");
+
+        // Simulate decryption boundary: decode from base64.
+        let decoded_bytes = import_from_encrypted_payload(&encoded).unwrap();
+        assert_eq!(decoded_bytes, plain_bytes, "decoded bytes must match original");
+
+        // Re-import the decoded JSON and validate.
+        let loaded = import_from_json(&decoded_bytes).unwrap();
+        assert_eq!(loaded.header.version, SCHEMA_VERSION);
+        assert!(loaded.verify_checksum());
+
+        if let SnapshotPayload::SavingsGoals(ref g) = loaded.payload {
+            assert_eq!(g.goals.len(), 1);
+            assert_eq!(g.goals[0].owner, "GBSINGLE");
+        } else {
+            panic!("Expected SavingsGoals payload variant");
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Security: tampered checksum
+    // -------------------------------------------------------------------------
+
+    /// E2E: mutating the checksum after export must cause `validate_for_import`
+    /// to return `Err(ChecksumMismatch)`.
+    ///
+    /// This guards against any post-export payload tampering.
+    #[test]
+    fn test_e2e_tampered_checksum_import_fails() {
+        let export = make_single_goal_export();
+        let mut snapshot = build_savings_snapshot(export, ExportFormat::Json);
+
+        // Tamper with the stored checksum.
+        snapshot.header.checksum = "deadbeef00000000000000000000000000000000000000000000000000000000"
+            .into();
+
+        assert!(
+            !snapshot.verify_checksum(),
+            "verify_checksum must return false for tampered header"
+        );
+        assert_eq!(
+            snapshot.validate_for_import(),
+            Err(MigrationError::ChecksumMismatch),
+            "import must be rejected with ChecksumMismatch"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Security: incompatible schema version
+    // -------------------------------------------------------------------------
+
+    /// E2E: setting an unsupported schema version must cause `validate_for_import`
+    /// to return `Err(IncompatibleVersion)`.
+    ///
+    /// This enforces version gating for future-proof migration safety.
+    #[test]
+    fn test_e2e_incompatible_version_import_fails() {
+        let export = make_single_goal_export();
+        let mut snapshot = build_savings_snapshot(export, ExportFormat::Json);
+
+        // Force an unsupported version.
+        snapshot.header.version = 0;
+
+        let err = snapshot.validate_for_import();
+        assert!(
+            matches!(
+                err,
+                Err(MigrationError::IncompatibleVersion {
+                    found: 0,
+                    min: MIN_SUPPORTED_VERSION,
+                    max: SCHEMA_VERSION,
+                })
+            ),
+            "import must be rejected with IncompatibleVersion, got {:?}",
+            err
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Edge case: empty goals list
+    // -------------------------------------------------------------------------
+
+    /// E2E: export and import a snapshot containing zero goals via JSON.
+    ///
+    /// Validates that the empty-list edge case is handled correctly by all
+    /// layers: checksum computation, serialization, deserialization.
+    #[test]
+    fn test_e2e_empty_goals_json_roundtrip() {
+        let export = SavingsGoalsExport {
+            next_id: 0,
+            goals: vec![],
+        };
+        let snapshot = build_savings_snapshot(export, ExportFormat::Json);
+        assert!(snapshot.verify_checksum());
+
+        let bytes = export_to_json(&snapshot).unwrap();
+        let loaded = import_from_json(&bytes).unwrap();
+        assert!(loaded.verify_checksum());
+
+        if let SnapshotPayload::SavingsGoals(ref g) = loaded.payload {
+            assert_eq!(g.goals.len(), 0, "empty goal list must round-trip as empty");
+            assert_eq!(g.next_id, 0);
+        } else {
+            panic!("Expected SavingsGoals payload variant");
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Edge case: locked goal preservation
+    // -------------------------------------------------------------------------
+
+    /// E2E: a goal with `locked: true` must survive JSON and binary roundtrips
+    /// with its locked flag intact.
+    #[test]
+    fn test_e2e_locked_goal_preserved_json_and_binary() {
+        let export = SavingsGoalsExport {
+            next_id: 2,
+            goals: vec![SavingsGoalExport {
+                id: 1,
+                owner: "GBLOCKED".into(),
+                name: "Long-term Savings".into(),
+                target_amount: 100_000,
+                current_amount: 50_000,
+                target_date: 2_500_000_000,
+                locked: true,
+            }],
+        };
+
+        // JSON path.
+        let json_snapshot = build_savings_snapshot(export.clone(), ExportFormat::Json);
+        let json_bytes = export_to_json(&json_snapshot).unwrap();
+        let json_loaded = import_from_json(&json_bytes).unwrap();
+        if let SnapshotPayload::SavingsGoals(ref g) = json_loaded.payload {
+            assert!(g.goals[0].locked, "locked flag must be true after JSON roundtrip");
+        } else {
+            panic!("Expected SavingsGoals payload variant");
+        }
+
+        // Binary path.
+        let bin_snapshot = build_savings_snapshot(export, ExportFormat::Binary);
+        let bin_bytes = export_to_binary(&bin_snapshot).unwrap();
+        let bin_loaded = import_from_binary(&bin_bytes).unwrap();
+        if let SnapshotPayload::SavingsGoals(ref g) = bin_loaded.payload {
+            assert!(g.goals[0].locked, "locked flag must be true after binary roundtrip");
+        } else {
+            panic!("Expected SavingsGoals payload variant");
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Determinism: checksum stability
+    // -------------------------------------------------------------------------
+
+    /// E2E: building the same snapshot twice must produce identical checksums.
+    ///
+    /// Validates that `build_savings_snapshot` is deterministic — i.e. the SHA-256
+    /// checksum is computed from a canonical JSON representation that does not
+    /// include any random or time-dependent state.
+    #[test]
+    fn test_e2e_snapshot_checksum_is_deterministic() {
+        let export_a = make_single_goal_export();
+        let export_b = make_single_goal_export();
+
+        let snap_a = build_savings_snapshot(export_a, ExportFormat::Json);
+        let snap_b = build_savings_snapshot(export_b, ExportFormat::Json);
+
+        assert_eq!(
+            snap_a.header.checksum, snap_b.header.checksum,
+            "identical payloads must produce identical checksums"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Multi-goal, multi-owner snapshot
+    // -------------------------------------------------------------------------
+
+    /// E2E: a snapshot with multiple goals across multiple owners must round-trip
+    /// via JSON with all records intact and all owner IDs preserved.
+    #[test]
+    fn test_e2e_multi_goal_multi_owner_json_roundtrip() {
+        let export = make_multi_goal_export();
+        let snapshot = build_savings_snapshot(export, ExportFormat::Json);
+        assert!(snapshot.verify_checksum());
+
+        let bytes = export_to_json(&snapshot).unwrap();
+        let loaded = import_from_json(&bytes).unwrap();
+        assert!(loaded.verify_checksum());
+
+        if let SnapshotPayload::SavingsGoals(ref g) = loaded.payload {
+            assert_eq!(g.next_id, 4);
+            assert_eq!(g.goals.len(), 3);
+
+            // Owner A has goals 1 and 2.
+            assert_eq!(g.goals[0].owner, "GBOWNER_A");
+            assert_eq!(g.goals[1].owner, "GBOWNER_A");
+            assert!(g.goals[1].locked);
+
+            // Owner B has goal 3.
+            assert_eq!(g.goals[2].owner, "GBOWNER_B");
+            assert_eq!(g.goals[2].name, "Education");
+        } else {
+            panic!("Expected SavingsGoals payload variant");
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Build helper: format label propagation
+    // -------------------------------------------------------------------------
+
+    /// Verify that `build_savings_snapshot` correctly propagates the format label
+    /// into the snapshot header for all four supported formats.
+    #[test]
+    fn test_e2e_build_savings_snapshot_format_label() {
+        let formats = [
+            (ExportFormat::Json, "json"),
+            (ExportFormat::Binary, "binary"),
+            (ExportFormat::Csv, "csv"),
+            (ExportFormat::Encrypted, "encrypted"),
+        ];
+        for (format, expected_label) in formats {
+            let export = make_single_goal_export();
+            let snapshot = build_savings_snapshot(export, format);
+            assert_eq!(
+                snapshot.header.format, expected_label,
+                "format label mismatch for {:?}",
+                format
+            );
+            assert!(snapshot.verify_checksum());
+        }
     }
 }

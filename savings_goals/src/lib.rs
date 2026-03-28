@@ -429,6 +429,8 @@ impl SavingsGoalContract {
                     panic!("Unauthorized: only current upgrade admin can transfer");
                 }
             }
+        } else if caller != new_admin {
+            panic!("Unauthorized: bootstrap requires caller == new_admin");
         }
 
         env.storage()
@@ -805,11 +807,11 @@ impl SavingsGoalContract {
         env: Env,
         caller: Address,
         contributions: Vec<ContributionItem>,
-    ) -> u32 {
+    ) -> Result<u32, SavingsGoalsError> {
         caller.require_auth();
         Self::require_not_paused(&env, pause_functions::ADD_TO_GOAL);
         if contributions.len() > MAX_BATCH_SIZE {
-            panic!("Batch too large");
+            return Err(SavingsGoalsError::InvalidAmount);
         }
         let goals_map: Map<u32, SavingsGoal> = env
             .storage()
@@ -818,14 +820,14 @@ impl SavingsGoalContract {
             .unwrap_or_else(|| Map::new(&env));
         for item in contributions.iter() {
             if item.amount <= 0 {
-                panic!("Amount must be positive");
+                return Err(SavingsGoalsError::InvalidAmount);
             }
             let goal = match goals_map.get(item.goal_id) {
                 Some(g) => g,
-                None => panic!("Goal not found"),
+                None => return Err(SavingsGoalsError::GoalNotFound),
             };
             if goal.owner != caller {
-                panic!("Not owner of all goals");
+                return Err(SavingsGoalsError::Unauthorized);
             }
         }
         Self::extend_instance_ttl(&env);
@@ -838,10 +840,10 @@ impl SavingsGoalContract {
         for item in contributions.iter() {
             let mut goal = match goals.get(item.goal_id) {
                 Some(g) => g,
-                None => panic!("Goal not found"),
+                None => return Err(SavingsGoalsError::GoalNotFound),
             };
             if goal.owner != caller {
-                panic!("Batch validation failed");
+                return Err(SavingsGoalsError::Unauthorized);
             }
             goal.current_amount = match goal.current_amount.checked_add(item.amount) {
                 Some(v) => v,
@@ -895,7 +897,7 @@ impl SavingsGoalContract {
             symbol_short!("batch_add"),
             (count, caller),
         );
-        count
+        Ok(count)
     }
 
     /// Withdraws funds from an existing savings goal.

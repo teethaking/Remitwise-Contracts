@@ -193,6 +193,22 @@ February 9th (January 10th + 30 days).
 
 Owner-only. Updates or clears the `external_ref` field of a policy.
 
+**Parameters**
+
+| Parameter    | Type              | Description                              |
+|--------------|-------------------|------------------------------------------|
+| `owner`      | `Address`         | Contract owner (must authorize)          |
+| `policy_id`  | `u32`             | Target policy ID                         |
+| `ext_ref`    | `Option<String>`  | New external reference (1–128 bytes or None) |
+
+**Validates**
+
+- Caller is the contract owner
+- Policy exists
+- External ref length is in range (1–128 bytes if Some, or None to clear)
+
+**Emits**: `ExternalRefUpdatedEvent`
+
 ---
 
 ### `deactivate_policy(owner, policy_id) → bool`
@@ -311,6 +327,24 @@ Published on successful `deactivate_policy`.
 
 Topic: `("deactive", "policy")`
 
+### `ExternalRefUpdatedEvent`
+
+Published on successful `set_external_ref`.
+
+| Field              | Type               |
+|--------------------|--------------------|
+| `policy_id`        | `u32`              |
+| `name`             | `String`           |
+| `new_external_ref` | `Option<String>`   |
+| `old_external_ref` | `Option<String>`   |
+| `timestamp`        | `u64`              |
+
+**Description**: Tracks external reference mutations for audit trails. The `old_external_ref`
+and `new_external_ref` fields capture the complete state transition (None→Some, Some→Some,
+Some→None), allowing off-chain systems to reconcile policy metadata across multiple updates.
+
+Topic: `("pol", "ext_upd")`
+
 ---
 
 ## Error Codes
@@ -367,13 +401,26 @@ RUST_TEST_THREADS=1 cargo test -p insurance --test gas_bench -- --nocapture
 ### Expected output (all tests passing)
 
 ```
-running 57 tests
+running 82 tests
 test tests::test_init_success ... ok
 test tests::test_create_health_policy_success ... ok
 ...
-test result: ok. 57 passed; 0 failed; 0 ignored
+test tests::test_set_external_ref_on_deactivated_policy_succeeds ... ok
+test result: ok. 82 passed; 0 failed; 0 ignored
 ```
 
+The comprehensive test suite includes:
+- 4 basic external_ref tests (set, clear, authorization, length validation)
+- 18 exhaustive external_ref mutation tests covering:
+  - Event emission validation
+  - State transitions (None→Some, Some→Some, Some→None)
+  - Idempotent and sequential mutations
+  - Persistence across policy operations
+  - Boundary conditions (min/max length)
+  - Empty string and special character handling
+  - Policy isolation and field preservation
+  - Deactivated policy behavior
+  - Authorization enforcement
 ---
 
 ## Integration Guide

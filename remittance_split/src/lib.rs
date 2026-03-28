@@ -441,6 +441,38 @@ impl RemittanceSplit {
         Ok(())
     }
 
+    /// Validate that every individual percentage is in [0, 100] **and** that
+    /// their sum equals exactly 100.
+    ///
+    /// Enforced invariants (checked in order):
+    /// 1. Each bucket must be <= 100 (`PercentageOutOfRange`).
+    /// 2. The four buckets must sum to exactly 100 (`PercentagesDoNotSumTo100`).
+    ///
+    /// Separating the two checks gives callers a precise error code:
+    /// a value like 110/0/0/0 produces `PercentageOutOfRange`, not a misleading
+    /// "doesn't sum to 100" message.
+    fn validate_percentages(
+        spending_percent: u32,
+        savings_percent: u32,
+        bills_percent: u32,
+        insurance_percent: u32,
+    ) -> Result<(), RemittanceSplitError> {
+        // Per-bucket upper-bound check — must precede sum check.
+        if spending_percent > 100
+            || savings_percent > 100
+            || bills_percent > 100
+            || insurance_percent > 100
+        {
+            return Err(RemittanceSplitError::PercentageOutOfRange);
+        }
+        // Global sum invariant.
+        let total = spending_percent + savings_percent + bills_percent + insurance_percent;
+        if total != 100 {
+            return Err(RemittanceSplitError::PercentagesDoNotSumTo100);
+        }
+        Ok(())
+    }
+
     /// Set or update the split percentages used to allocate remittances.
     ///
     /// # Arguments
@@ -494,8 +526,7 @@ impl RemittanceSplit {
             return Err(RemittanceSplitError::AlreadyInitialized);
         }
 
-        let total = spending_percent + savings_percent + bills_percent + insurance_percent;
-        if total != 100 {
+        if let Err(e) = Self::validate_percentages(spending_percent, savings_percent, bills_percent, insurance_percent) {
             Self::append_audit(&env, symbol_short!("init"), &owner, false);
             return Err(RemittanceSplitError::InvalidPercentages);
         }
@@ -564,8 +595,7 @@ impl RemittanceSplit {
             return Err(RemittanceSplitError::Unauthorized);
         }
 
-        let total = spending_percent + savings_percent + bills_percent + insurance_percent;
-        if total != 100 {
+        if let Err(e) = Self::validate_percentages(spending_percent, savings_percent, bills_percent, insurance_percent) {
             Self::append_audit(&env, symbol_short!("update"), &caller, false);
             return Err(RemittanceSplitError::InvalidPercentages);
         }

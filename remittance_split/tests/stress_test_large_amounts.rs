@@ -10,7 +10,15 @@ fn dummy_token(env: &Env) -> Address {
     Address::generate(env)
 }
 
-fn init(client: &RemittanceSplitClient, env: &Env, owner: &Address, s: u32, g: u32, b: u32, i: u32) {
+fn init(
+    client: &RemittanceSplitClient,
+    env: &Env,
+    owner: &Address,
+    s: u32,
+    g: u32,
+    b: u32,
+    i: u32,
+) {
     let token = dummy_token(env);
     client.initialize_split(owner, &0, &token, &s, &g, &b, &i);
 }
@@ -51,6 +59,26 @@ fn test_calculate_split_near_max_safe_value() {
     let total: i128 = amounts.iter().sum();
     assert!((total - max_safe).abs() < 4);
 }
+
+//#[test]
+// fn test_calculate_split_overflow_detection() {
+//     let env = Env::default();
+//     let contract_id = env.register_contract(None, RemittanceSplit);
+//     let client = RemittanceSplitClient::new(&env, &contract_id);
+//     let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+//     env.mock_all_auths();
+
+//     client.initialize_split(&owner, &0, &50, &30, &15, &5);
+
+//     // Value that will overflow when multiplied by percentage
+//     let overflow_amount = i128::MAX / 50 + 1; // Will overflow when multiplied by 50
+
+//     let result = client.try_calculate_split(&overflow_amount);
+
+//     // Should return Overflow error, not panic
+//     assert_eq!(result, Err(Ok(RemittanceSplitError::Overflow)));
+// }
 
 #[test]
 fn test_calculate_split_with_minimal_percentages() {
@@ -174,7 +202,13 @@ fn test_sequential_large_calculations() {
 
     init(&client, &env, &owner, 50, 30, 15, 5);
 
-    for amount in &[i128::MAX / 1000, i128::MAX / 500, i128::MAX / 200, i128::MAX / 150, i128::MAX / 100] {
+    for amount in &[
+        i128::MAX / 1000,
+        i128::MAX / 500,
+        i128::MAX / 200,
+        i128::MAX / 150,
+        i128::MAX / 100,
+    ] {
         let result = client.try_calculate_split(amount);
         assert!(result.is_ok(), "Failed for amount: {}", amount);
         let splits = result.unwrap().unwrap();
@@ -195,7 +229,11 @@ fn test_checked_arithmetic_prevents_silent_overflow() {
 
     for amount in &[i128::MAX / 40, i128::MAX / 30, i128::MAX] {
         let result = client.try_calculate_split(amount);
-        assert!(result.is_err(), "Should have detected overflow for amount: {}", amount);
+        assert!(
+            result.is_err(),
+            "Should have detected overflow for amount: {}",
+            amount
+        );
     }
 }
 

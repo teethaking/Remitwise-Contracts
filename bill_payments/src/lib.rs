@@ -8,8 +8,6 @@ use remitwise_common::{
     ARCHIVE_LIFETIME_THRESHOLD, CONTRACT_VERSION, INSTANCE_BUMP_AMOUNT,
     INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_SIZE, MAX_PAGE_LIMIT,
 };
-#[cfg(test)]
-use remitwise_common::MAX_PAGE_LIMIT;
 
 use alloc::vec::Vec as StdVec;
 use soroban_sdk::{

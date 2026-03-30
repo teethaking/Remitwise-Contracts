@@ -1,8 +1,8 @@
 #![no_std]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token::TokenClient, Address,
-    Env, Map, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token::TokenClient,
+    panic_with_error, Address, Env, Map, Symbol, Vec,
 };
 
 use remitwise_common::{FamilyRole, EventCategory, EventPriority, RemitwiseEvents};
@@ -263,6 +263,7 @@ impl FamilyWallet {
                 address: owner.clone(),
                 role: FamilyRole::Owner,
                 spending_limit: 0,
+                precision_limit: None,
                 added_at: timestamp,
             },
         );
@@ -274,6 +275,7 @@ impl FamilyWallet {
                     address: member_addr.clone(),
                     role: FamilyRole::Member,
                     spending_limit: 0,
+                    precision_limit: None,
                     added_at: timestamp,
                 },
             );
@@ -520,6 +522,22 @@ impl FamilyWallet {
         }
 
         amount <= member.spending_limit
+    }
+
+    pub fn validate_precision_spending(
+        env: Env,
+        caller: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        if !Self::check_spending_limit(env.clone(), caller.clone(), amount) {
+            return Err(Error::Unauthorized);
+        }
+
+        Ok(())
     }
 
     /// @notice Configure multisig parameters for a given transaction type.
@@ -902,12 +920,22 @@ impl FamilyWallet {
             panic!("Maximum pending emergency proposals reached");
         }
 
-        Self::propose_transaction(
-            env,
-            proposer,
+        let tx_id = Self::propose_transaction(
+            env.clone(),
+            proposer.clone(),
             TransactionType::EmergencyTransfer,
-            TransactionData::EmergencyTransfer(token, recipient, amount),
-        )
+            TransactionData::EmergencyTransfer(token.clone(), recipient.clone(), amount),
+        );
+
+        Self::append_access_audit(
+            &env,
+            symbol_short!("em_prop"),
+            &proposer,
+            Some(recipient.clone()),
+            true,
+        );
+
+        tx_id
     }
 
     pub fn propose_policy_cancellation(env: Env, proposer: Address, policy_id: u32) -> u64 {
@@ -919,6 +947,10 @@ impl FamilyWallet {
         )
     }
 
+    /// Configure emergency transfer guardrails.
+    ///
+    /// Only `Owner` or `Admin` may update emergency settings.
+    /// Successful configuration is recorded in the access audit trail.
     pub fn configure_emergency(
         env: Env,
         caller: Address,
@@ -952,9 +984,14 @@ impl FamilyWallet {
             },
         );
 
+        Self::append_access_audit(&env, symbol_short!("em_conf"), &caller, None, true);
+
         true
     }
 
+    /// Enable or disable emergency mode.
+    ///
+    /// This operation is restricted to `Owner` or `Admin` and is recorded in the access audit trail.
     pub fn set_emergency_mode(env: Env, caller: Address, enabled: bool) -> bool {
         caller.require_auth();
         Self::require_not_paused(&env);
@@ -981,6 +1018,8 @@ impl FamilyWallet {
             symbol_short!("em_mode"),
             event,
         );
+
+        Self::append_access_audit(&env, symbol_short!("em_mode"), &caller, None, true);
 
         true
     }
@@ -1647,7 +1686,15 @@ impl FamilyWallet {
 
         env.events().publish(
             (symbol_short!("emerg"), EmergencyEvent::TransferExec),
-            (proposer, recipient, amount),
+            (proposer.clone(), recipient.clone(), amount),
+        );
+
+        Self::append_access_audit(
+            &env,
+            symbol_short!("em_exec"),
+            &proposer,
+            Some(recipient.clone()),
+            true,
         );
 
         0

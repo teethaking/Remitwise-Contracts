@@ -756,6 +756,92 @@ fn test_emergency_mode_direct_transfer_within_limits() {
 
     let last_ts = client.get_last_emergency_at();
     assert!(last_ts.is_some());
+
+    let audit = client.get_access_audit(&2);
+    assert_eq!(audit.len(), 2);
+    let em_exec = audit.get(1).unwrap();
+    assert_eq!(em_exec.operation, symbol_short!("em_exec"));
+    assert_eq!(em_exec.caller, owner);
+    assert_eq!(em_exec.target, Some(recipient));
+    assert!(em_exec.success);
+}
+
+#[test]
+fn test_set_emergency_mode_appends_access_audit() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let initial_members = Vec::new(&env);
+    client.init(&owner, &initial_members);
+
+    assert!(client.set_emergency_mode(&owner, &true));
+
+    let audit = client.get_access_audit(&1);
+    assert_eq!(audit.len(), 1);
+    let entry = audit.get(0).unwrap();
+    assert_eq!(entry.operation, symbol_short!("em_mode"));
+    assert_eq!(entry.caller, owner);
+    assert!(entry.target.is_none());
+    assert!(entry.success);
+}
+
+#[test]
+fn test_configure_emergency_appends_access_audit() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let initial_members = Vec::new(&env);
+    client.init(&owner, &initial_members);
+
+    assert!(client.configure_emergency(&owner, &2000_0000000, &3600u64, &500_0000000, &10000_0000000));
+
+    let audit = client.get_access_audit(&1);
+    assert_eq!(audit.len(), 1);
+    let entry = audit.get(0).unwrap();
+    assert_eq!(entry.operation, symbol_short!("em_conf"));
+    assert_eq!(entry.caller, owner);
+    assert!(entry.target.is_none());
+    assert!(entry.success);
+}
+
+#[test]
+fn test_propose_emergency_transfer_appends_access_audit() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let initial_members = Vec::new(&env);
+    client.init(&owner, &initial_members);
+
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let recipient = Address::generate(&env);
+    let amount = 3000_0000000;
+
+    let tx_id = client.propose_emergency_transfer(
+        &owner,
+        &token_contract.address(),
+        &recipient,
+        &amount,
+    );
+
+    assert!(tx_id > 0);
+
+    let audit = client.get_access_audit(&1);
+    assert_eq!(audit.len(), 1);
+    let entry = audit.get(0).unwrap();
+    assert_eq!(entry.operation, symbol_short!("em_prop"));
+    assert_eq!(entry.caller, owner);
+    assert_eq!(entry.target, Some(recipient));
+    assert!(entry.success);
 }
 
 #[test]

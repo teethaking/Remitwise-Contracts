@@ -57,12 +57,6 @@ pub enum ChecksumAlgorithm {
     Sha256,
 }
 
-impl Default for ChecksumAlgorithm {
-    fn default() -> Self {
-        Self::Sha256
-    }
-}
-
 /// Versioned migration event payload meant for indexing and historical tracking.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MigrationEvent {

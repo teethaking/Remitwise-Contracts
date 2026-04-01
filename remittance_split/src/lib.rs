@@ -167,6 +167,21 @@ pub struct ExportSnapshot {
     pub exported_at: u64,
 }
 
+#[contracttype]
+#[derive(Clone)]
+pub struct SplitAuthPayload {
+    pub domain_id: Symbol,
+    pub network_id: BytesN<32>,
+    pub contract_addr: Address,
+    pub owner_addr: Address,
+    pub nonce_val: u64,
+    pub usdc_contract: Address,
+    pub spending_percent: u32,
+    pub savings_percent: u32,
+    pub bills_percent: u32,
+    pub insurance_percent: u32,
+}
+
 /// Audit log entry for security and compliance.
 #[contracttype]
 #[derive(Clone)]
@@ -1039,7 +1054,7 @@ impl RemittanceSplit {
 
         // 6. Timestamp sanity — reject payloads whose timestamps are in the future.
         let current_time = env.ledger().timestamp();
-        if snapshot.config.timestamp > current_time || snapshot.exported_at > current_time {
+        if snapshot.config.timestamp > current_time {
             Self::append_audit(&env, symbol_short!("import"), &caller, false);
             return Err(RemittanceSplitError::FutureTimestamp);
         }
@@ -1133,7 +1148,7 @@ impl RemittanceSplit {
         let expected = Self::compute_checksum(
             snapshot.schema_version,
             &snapshot.config,
-            snapshot.exported_at,
+            &snapshot.schedules,
         );
         if snapshot.checksum != expected {
             return Err(RemittanceSplitError::ChecksumMismatch);
@@ -1164,7 +1179,7 @@ impl RemittanceSplit {
 
         // 6. Timestamp sanity
         let current_time = env.ledger().timestamp();
-        if snapshot.config.timestamp > current_time || snapshot.exported_at > current_time {
+        if snapshot.config.timestamp > current_time {
             return Err(RemittanceSplitError::FutureTimestamp);
         }
 

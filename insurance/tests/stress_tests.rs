@@ -154,7 +154,8 @@ fn stress_policies_across_10_users() {
             "Each user's total premium must reflect only their own policies"
         );
 
-        let active = client.get_active_policies(user);
+        let page = client.get_active_policies(user, &0u32, &50u32);
+        let active = page.items;
         assert_eq!(
             active.len(),
             POLICIES_PER_USER,
@@ -310,7 +311,8 @@ fn stress_deactivate_half_of_200_policies() {
 
     let mut all_ids = std::vec![];
     for _ in 0..200 {
-        client.create_policy(&owner, &name, &coverage_type, &80i128, &8_000i128, &None);
+        let id = client.create_policy(&owner, &name, &coverage_type, &80i128, &8_000i128, &None);
+        all_ids.push(id);
     }
 
     // Deactivate even-indexed policies
@@ -320,11 +322,20 @@ fn stress_deactivate_half_of_200_policies() {
         }
     }
 
-    let active = client.get_active_policies(&owner);
+    // Count all active policies via pagination.
+    let mut collected = 0u32;
+    let mut cursor = 0u32;
+    loop {
+        let page = client.get_active_policies(&owner, &cursor, &50u32);
+        collected += page.count;
+        if page.next_cursor == 0 {
+            break;
+        }
+        cursor = page.next_cursor;
+    }
     assert_eq!(
-        active.len(),
-        100,
-        "After deactivating 100 of 200 policies, only 100 must be returned"
+        collected, 100,
+        "After deactivating 100 of 200 policies, only 100 must remain active"
     );
 
     let remaining_premium = client.get_total_monthly_premium(&owner);
@@ -350,8 +361,8 @@ fn bench_get_active_policies_200_policies() {
         client.create_policy(&owner, &name, &coverage_type, &100i128, &10_000i128, &None);
     }
 
-    let (cpu, mem, active) = measure(&env, || client.get_active_policies(&owner));
-    assert_eq!(active.len(), 200, "Must return all 200 policies");
+    let (cpu, mem, active) = measure(&env, || client.get_active_policies(&owner, &0u32, &50u32));
+    assert_eq!(active.items.len(), 50, "Must return first page (limit 50)");
 
     println!(
         r#"{{"contract":"insurance","method":"get_active_policies","scenario":"200_policies","cpu":{},"mem":{}}}"#,

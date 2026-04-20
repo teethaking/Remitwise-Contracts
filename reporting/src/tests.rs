@@ -5,7 +5,10 @@ use soroban_sdk::{
 };
 use testutils::set_ledger_time;
 
-use crate::{Category, ReportingContract, ReportingContractClient};
+use crate::{
+    Category, ContractAddresses, DataAvailability, ReportingContract, ReportingContractClient,
+    ReportingError,
+};
 
 /// Minimal env with mock_all_auths — replaces the removed create_test_env helper.
 fn create_test_env() -> Env {
@@ -508,7 +511,6 @@ mod failing_remittance_split {
 }
 
 #[test]
-#[should_panic(expected = "Remote call failing to simulate Partial Data")]
 fn test_get_remittance_summary_partial_data_remote_failure_propagates() {
     let env = soroban_sdk::Env::default();
     env.mock_all_auths();
@@ -536,8 +538,9 @@ fn test_get_remittance_summary_partial_data_remote_failure_propagates() {
     );
 
     let total_amount = 10000i128;
-    // Cross-contract panics from `remittance_split` are not swallowed; callers observe host failure.
-    let _summary = client.get_remittance_summary(&user, &total_amount, &0, &0);
+    // Remote failures are converted into partial data.
+    let summary = client.get_remittance_summary(&user, &total_amount, &0, &0);
+    assert_eq!(summary.data_availability, DataAvailability::Partial);
 }
 
 #[test]
@@ -1806,19 +1809,18 @@ fn test_archive_old_reports_admin_succeeds() {
 
 /// archive_old_reports panics when called by a non-admin.
 #[test]
-#[should_panic(expected = "Only admin can archive reports")]
 fn test_archive_old_reports_non_admin_rejected() {
     let env = create_test_env();
     set_ledger_time(&env, 1, 1_704_067_200);
     let (client, _, _, _, _, _) = setup_reporting(&env);
     let attacker = Address::generate(&env);
 
-    client.archive_old_reports(&attacker, &2_000_000_000u64);
+    let result = client.try_archive_old_reports(&attacker, &2_000_000_000u64);
+    assert_eq!(result, Err(Ok(ReportingError::Unauthorized)));
 }
 
 /// archive_old_reports panics when called by a regular user (not admin).
 #[test]
-#[should_panic(expected = "Only admin can archive reports")]
 fn test_archive_old_reports_regular_user_rejected() {
     let env = create_test_env();
     set_ledger_time(&env, 1, 1_704_067_200);
@@ -1829,7 +1831,8 @@ fn test_archive_old_reports_regular_user_rejected() {
     client.store_report(&user, &report, &202_401u64);
 
     // user tries to archive — must be rejected
-    client.archive_old_reports(&user, &2_000_000_000u64);
+    let result = client.try_archive_old_reports(&user, &2_000_000_000u64);
+    assert_eq!(result, Err(Ok(ReportingError::Unauthorized)));
 }
 
 /// archive_old_reports records require_auth for the admin caller.
@@ -1869,19 +1872,18 @@ fn test_cleanup_old_reports_admin_succeeds() {
 
 /// cleanup_old_reports panics when called by a non-admin.
 #[test]
-#[should_panic(expected = "Only admin can cleanup reports")]
 fn test_cleanup_old_reports_non_admin_rejected() {
     let env = create_test_env();
     set_ledger_time(&env, 1, 1_704_067_200);
     let (client, _, _, _, _, _) = setup_reporting(&env);
     let attacker = Address::generate(&env);
 
-    client.cleanup_old_reports(&attacker, &2_000_000_000u64);
+    let result = client.try_cleanup_old_reports(&attacker, &2_000_000_000u64);
+    assert_eq!(result, Err(Ok(ReportingError::Unauthorized)));
 }
 
 /// cleanup_old_reports panics when called by a regular user.
 #[test]
-#[should_panic(expected = "Only admin can cleanup reports")]
 fn test_cleanup_old_reports_regular_user_rejected() {
     let env = create_test_env();
     set_ledger_time(&env, 1, 1_704_067_200);
@@ -1893,7 +1895,8 @@ fn test_cleanup_old_reports_regular_user_rejected() {
     client.archive_old_reports(&admin, &2_000_000_000u64);
 
     // user tries to cleanup — must be rejected
-    client.cleanup_old_reports(&user, &2_000_000_000u64);
+    let result = client.try_cleanup_old_reports(&user, &2_000_000_000u64);
+    assert_eq!(result, Err(Ok(ReportingError::Unauthorized)));
 }
 
 /// cleanup_old_reports records require_auth for the admin caller.

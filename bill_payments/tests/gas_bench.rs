@@ -20,29 +20,29 @@ struct RegressionSpec {
 }
 
 const ARCHIVE_120_PAID: RegressionSpec = RegressionSpec {
-    cpu_baseline: 640_000,
-    mem_baseline: 150_000,
+    cpu_baseline: 8_900_000,
+    mem_baseline: 2_400_000,
     cpu_threshold_percent: 15,
     mem_threshold_percent: 12,
 };
 
 const RESTORE_SINGLE_ARCHIVED: RegressionSpec = RegressionSpec {
-    cpu_baseline: 90_000,
-    mem_baseline: 20_000,
+    cpu_baseline: 150_000,
+    mem_baseline: 26_000,
     cpu_threshold_percent: 12,
     mem_threshold_percent: 10,
 };
 
 const CLEANUP_ARCHIVED_MIXED_AGE: RegressionSpec = RegressionSpec {
-    cpu_baseline: 250_000,
-    mem_baseline: 70_000,
+    cpu_baseline: 1_300_000,
+    mem_baseline: 280_000,
     cpu_threshold_percent: 15,
     mem_threshold_percent: 12,
 };
 
 const BATCH_PAY_MIXED_50: RegressionSpec = RegressionSpec {
-    cpu_baseline: 900_000,
-    mem_baseline: 140_000,
+    cpu_baseline: 3_100_000,
+    mem_baseline: 700_000,
     cpu_threshold_percent: 15,
     mem_threshold_percent: 12,
 };

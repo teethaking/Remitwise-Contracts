@@ -48,6 +48,21 @@ where
     (cpu_cost, memory_cost, result)
 }
 
+fn init_split(env: &Env, client: &RemittanceSplitClient, owner: &Address) {
+    let token_admin = <Address as AddressTrait>::generate(env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin);
+    let ok = client.initialize_split(
+        owner,
+        &0u64,
+        &token_contract.address(),
+        &50u32,
+        &30u32,
+        &15u32,
+        &5u32,
+    );
+    assert!(ok, "initialize_split must succeed for schedule tests");
+}
+
 /// Test: Validate create_remittance_schedule gas measurement
 #[test]
 fn test_create_schedule_gas_measurement() {
@@ -56,6 +71,7 @@ fn test_create_schedule_gas_measurement() {
     let client = RemittanceSplitClient::new(&env, &contract_id);
 
     let owner = <Address as AddressTrait>::generate(&env);
+    init_split(&env, &client, &owner);
     let amount = 1_000i128;
     let next_due = env.ledger().timestamp() + 86400; // 1 day from now
     let interval = 2_592_000u64; // 30 days
@@ -84,6 +100,7 @@ fn test_modify_schedule_gas_measurement() {
     let client = RemittanceSplitClient::new(&env, &contract_id);
 
     let owner = <Address as AddressTrait>::generate(&env);
+    init_split(&env, &client, &owner);
     let amount = 1_000i128;
     let next_due = env.ledger().timestamp() + 86400;
     let interval = 2_592_000u64;
@@ -126,6 +143,7 @@ fn test_cancel_schedule_gas_measurement() {
     let client = RemittanceSplitClient::new(&env, &contract_id);
 
     let owner = <Address as AddressTrait>::generate(&env);
+    init_split(&env, &client, &owner);
     let amount = 1_000i128;
     let next_due = env.ledger().timestamp() + 86400;
     let interval = 2_592_000u64;
@@ -181,6 +199,7 @@ fn test_query_schedules_with_data_gas_measurement() {
     let client = RemittanceSplitClient::new(&env, &contract_id);
 
     let owner = <Address as AddressTrait>::generate(&env);
+    init_split(&env, &client, &owner);
 
     // Create 5 schedules
     for i in 1..=5 {
@@ -214,6 +233,7 @@ fn test_query_single_schedule_gas_measurement() {
     let client = RemittanceSplitClient::new(&env, &contract_id);
 
     let owner = <Address as AddressTrait>::generate(&env);
+    init_split(&env, &client, &owner);
     let amount = 1_000i128;
     let next_due = env.ledger().timestamp() + 86400;
     let interval = 2_592_000u64;
@@ -247,6 +267,7 @@ fn test_gas_scaling_with_multiple_schedules() {
     let client = RemittanceSplitClient::new(&env, &contract_id);
 
     let owner = <Address as AddressTrait>::generate(&env);
+    init_split(&env, &client, &owner);
 
     // Create 10 schedules first
     for i in 1..=10 {
@@ -287,6 +308,7 @@ fn test_data_isolation_security() {
 
     let owner1 = <Address as AddressTrait>::generate(&env);
     let owner2 = <Address as AddressTrait>::generate(&env);
+    init_split(&env, &client, &owner1);
 
     // Create schedules for owner1
     for i in 1..=3 {
@@ -297,13 +319,13 @@ fn test_data_isolation_security() {
         let _result = client.create_remittance_schedule(&owner1, &amount, &next_due, &interval);
     }
 
-    // Create schedules for owner2
+    // Owner2 cannot create schedules (split is bound to owner1).
     for i in 1..=2 {
         let amount = 2_000i128 * i as i128;
         let next_due = env.ledger().timestamp() + 86400 * i;
         let interval = 604_800u64;
-        
-        let _result = client.create_remittance_schedule(&owner2, &amount, &next_due, &interval);
+        let result = client.try_create_remittance_schedule(&owner2, &amount, &next_due, &interval);
+        assert_eq!(result, Err(Ok(RemittanceSplitError::Unauthorized)));
     }
 
     // Validate data isolation
@@ -315,11 +337,7 @@ fn test_data_isolation_security() {
         3,
         "Owner1 should see only their 3 schedules"
     );
-    assert_eq!(
-        owner2_schedules.len(),
-        2,
-        "Owner2 should see only their 2 schedules"
-    );
+    assert_eq!(owner2_schedules.len(), 0, "Owner2 should see no schedules");
 
     // Validate schedule ownership
     for schedule in owner1_schedules.iter() {
@@ -329,14 +347,7 @@ fn test_data_isolation_security() {
         );
     }
 
-    for schedule in owner2_schedules.iter() {
-        assert_eq!(
-            schedule.owner, owner2,
-            "All owner2 schedules should belong to owner2"
-        );
-    }
-
-    println!("✅ Data isolation validated - Owner1: 3 schedules, Owner2: 2 schedules");
+    println!("✅ Data isolation validated - Owner1: 3 schedules, Owner2: 0 schedules");
 }
 
 /// Test: Input validation security
@@ -347,6 +358,7 @@ fn test_input_validation_security() {
     let client = RemittanceSplitClient::new(&env, &contract_id);
 
     let owner = <Address as AddressTrait>::generate(&env);
+    init_split(&env, &client, &owner);
 
     // Test invalid amount (zero)
     let result = client.try_create_remittance_schedule(
@@ -382,7 +394,7 @@ fn test_input_validation_security() {
         &(env.ledger().timestamp() + 86400),
         &2_592_000u64
     );
-    assert!(result.is_ok(), "Valid parameters should succeed");
+    assert_eq!(ok_id, 1, "Valid parameters should succeed");
 
     println!("✅ Input validation security verified");
 }
@@ -395,6 +407,7 @@ fn test_complete_schedule_lifecycle() {
     let client = RemittanceSplitClient::new(&env, &contract_id);
 
     let owner = <Address as AddressTrait>::generate(&env);
+    init_split(&env, &client, &owner);
     let amount = 1_000i128;
     let next_due = env.ledger().timestamp() + 86400;
     let interval = 2_592_000u64;
@@ -473,6 +486,7 @@ fn test_performance_stress() {
     let client = RemittanceSplitClient::new(&env, &contract_id);
 
     let owner = <Address as AddressTrait>::generate(&env);
+    init_split(&env, &client, &owner);
 
     println!("🚀 Running performance stress test...");
 

@@ -8,16 +8,14 @@ use remitwise_common::{
 };
 #[cfg(test)]
 use remitwise_common::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
-    INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_SIZE, MAX_PAGE_LIMIT,
-};
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Map, String,
     Symbol, Vec,
 };
 
-const MAX_FREQUENCY_DAYS: u32 = 36500; // 100 years
-const SECONDS_PER_DAY: u64 = 86400;
+const MAX_FREQUENCY_DAYS: u32 = 36_500; // 100 years
+const SECONDS_PER_DAY: u64 = 86_400;
 
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -62,8 +60,6 @@ pub mod pause_functions {
 }
 
 const STORAGE_UNPAID_TOTALS: Symbol = symbol_short!("UNPD_TOT");
-const MAX_FREQUENCY_DAYS: u32 = 36_500;
-const SECONDS_PER_DAY: u64 = 86_400;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -97,7 +93,12 @@ pub enum BillPaymentsError {
     InvalidTag = 13,
     /// Tags list is empty
     EmptyTags = 14,
+    /// Currency code is invalid (empty, too long, or contains non-alphanumeric)
+    InvalidCurrency = 15,
 }
+
+// Back-compat alias: large parts of this crate (and tests) still refer to `Error`.
+pub type Error = BillPaymentsError;
 
 #[contracttype]
 #[derive(Clone)]
@@ -142,7 +143,6 @@ pub enum BillEvent {
 
 #[derive(Clone, Debug)]
 #[contracttype]
-#[derive(Clone)]
 pub struct StorageStats {
     pub active_bills: u32,
     pub archived_bills: u32,
@@ -452,8 +452,6 @@ impl BillPayments {
                     return Err(Error::Unauthorized);
                 }
             }
-            Some(adm) if adm != caller => return Err(BillPaymentsError::Unauthorized),
-            _ => {}
         }
 
         env.storage()
@@ -574,6 +572,7 @@ impl BillPayments {
             + 1;
 
         let current_time = env.ledger().timestamp();
+        let bill_external_ref = external_ref.clone();
         let bill = Bill {
             id: next_id,
             owner: owner.clone(),
@@ -629,6 +628,7 @@ impl BillPayments {
             .unwrap_or_else(|| Map::new(&env));
 
         let mut bill = bills.get(bill_id).ok_or(BillPaymentsError::BillNotFound)?;
+        let bill_external_ref = bill.external_ref.clone();
 
         if bill.owner != caller {
             return Err(BillPaymentsError::Unauthorized);
@@ -1188,7 +1188,6 @@ impl BillPayments {
             id: archived_bill.id,
             owner: archived_bill.owner.clone(),
             name: archived_bill.name.clone(),
-            external_ref: None,
             external_ref: archived_bill.external_ref.clone(),
             amount: archived_bill.amount,
             due_date: env.ledger().timestamp() + 2592000,
@@ -3152,9 +3151,12 @@ mod test {
         ids.push_back(alice_bill);
         ids.push_back(bob_bill);
 
-        // Alice tries to batch pay both, but one is Bob's
+        // Alice tries to batch pay both: her bill is paid, Bob's is skipped.
         let result = client.try_batch_pay_bills(&alice, &ids);
-        assert_eq!(result, Err(Ok(Error::Unauthorized)));
+        assert_eq!(result, Ok(Ok(1)));
+
+        assert!(client.get_bill(&alice_bill).unwrap().paid);
+        assert!(!client.get_bill(&bob_bill).unwrap().paid);
     }
 
     #[test]

@@ -5,7 +5,7 @@ use soroban_sdk::{
     token::TokenClient, Address, Env, Map, Symbol, Vec,
 };
 
-use remitwise_common::{FamilyRole, EventCategory, EventPriority, RemitwiseEvents};
+use remitwise_common::{FamilyRole, EventCategory, EventPriority, RemitwiseEvents, CONTRACT_VERSION};
 
 // Storage TTL constants for active data
 const INSTANCE_LIFETIME_THRESHOLD: u32 = 17280;
@@ -17,6 +17,27 @@ const ARCHIVE_BUMP_AMOUNT: u32 = 2592000;
 
 // Signature expiration time constants
 const DEFAULT_PROPOSAL_EXPIRY: u64 = 86400; // 24 hours
+const MAX_PROPOSAL_EXPIRY: u64 = 604_800; // 7 days
+
+// Multisig configuration bounds
+const MIN_THRESHOLD: u32 = 1;
+const MAX_SIGNERS: u32 = 20;
+
+// Batch bounds
+const MAX_BATCH_MEMBERS: u32 = 50;
+
+// Access audit bounds
+const MAX_ACCESS_AUDIT_ENTRIES: u32 = 200;
+
+#[contracttype]
+#[derive(Clone)]
+pub struct AccessAuditEntry {
+    pub operation: Symbol,
+    pub caller: Address,
+    pub target: Option<Address>,
+    pub success: bool,
+    pub timestamp: u64,
+}
 
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -107,6 +128,8 @@ pub struct FamilyMember {
     pub role: FamilyRole,
     /// Legacy per-transaction cap in stroops. 0 = unlimited.
     pub spending_limit: i128,
+    /// Optional precision spending guardrails for cumulative/rollover enforcement.
+    pub precision_limit: PrecisionLimitOpt,
     pub added_at: u64,
 }
 
@@ -178,8 +201,6 @@ pub struct StorageStats {
     pub last_updated: u64,
 }
 
-#[contracttype]
-#[derive(Clone)]
 const MAX_THRESHOLD: u32 = 100;
 
 #[contracttype]
@@ -187,46 +208,6 @@ const MAX_THRESHOLD: u32 = 100;
 pub struct BatchMemberItem {
     pub address: Address,
     pub role: FamilyRole,
-}
-
-/// Spending period configuration for rollover behavior
-#[contracttype]
-#[derive(Clone)]
-pub struct SpendingPeriod {
-    /// Period type: 0=Daily, 1=Weekly, 2=Monthly
-    pub period_type: u32,
-    /// Period start timestamp (aligned to period boundary)
-    pub period_start: u64,
-    /// Period duration in seconds
-    pub period_duration: u64,
-}
-
-/// Cumulative spending tracking for precision validation
-#[contracttype]
-#[derive(Clone)]
-pub struct SpendingTracker {
-    /// Current period spending amount
-    pub current_spent: i128,
-    /// Last transaction timestamp for precision validation
-    pub last_tx_timestamp: u64,
-    /// Transaction count in current period
-    pub tx_count: u32,
-    /// Period configuration
-    pub period: SpendingPeriod,
-}
-
-/// Precision spending guardrail configuration for member withdrawals.
-#[contracttype]
-#[derive(Clone, Copy)]
-pub struct PrecisionSpendingLimit {
-    /// Maximum cumulative spending allowed per daily period.
-    pub limit: i128,
-    /// Minimum allowed withdrawal size.
-    pub min_precision: i128,
-    /// Maximum allowed amount for a single withdrawal.
-    pub max_single_tx: i128,
-    /// Whether cumulative daily tracking is enforced.
-    pub enable_rollover: bool,
 }
 
 #[contracttype]
@@ -278,12 +259,7 @@ pub enum Error {
 
 #[contractimpl]
 impl FamilyWallet {
-    fn validate_precision_spending(_env: Env, _proposer: Address, _amount: i128) -> Result<(), Error> {
-        Ok(())
-    }
-
     pub fn init(env: Env, owner: Address, initial_members: Vec<Address>) -> bool {
-                precision_limit: None,
         owner.require_auth();
 
         let existing: Option<Address> = env.storage().instance().get(&symbol_short!("OWNER"));
@@ -295,7 +271,6 @@ impl FamilyWallet {
 
         env.storage()
             .instance()
-                    precision_limit: None,
             .set(&symbol_short!("OWNER"), &owner);
 
         let mut members: Map<Address, FamilyMember> = Map::new(&env);
@@ -307,7 +282,7 @@ impl FamilyWallet {
                 address: owner.clone(),
                 role: FamilyRole::Owner,
                 spending_limit: 0,
-                precision_limit: None,
+                precision_limit: PrecisionLimitOpt::None,
                 added_at: timestamp,
             },
         );
@@ -319,7 +294,7 @@ impl FamilyWallet {
                     address: member_addr.clone(),
                     role: FamilyRole::Member,
                     spending_limit: 0,
-                    precision_limit: None,
+                    precision_limit: PrecisionLimitOpt::None,
                     added_at: timestamp,
                 },
             );
@@ -422,6 +397,7 @@ impl FamilyWallet {
                 address: member_address.clone(),
                 role,
                 spending_limit,
+                precision_limit: PrecisionLimitOpt::None,
                 added_at: now,
             },
         );
@@ -1101,6 +1077,7 @@ impl FamilyWallet {
                 address: member.clone(),
                 role,
                 spending_limit: 0,
+                precision_limit: PrecisionLimitOpt::None,
                 added_at: timestamp,
             },
         );
@@ -1745,7 +1722,7 @@ impl FamilyWallet {
             .set(&symbol_short!("SPND_TRK"), &trackers);
     }
 
-    fn validate_precision_spending(
+    fn validate_precision_spending_internal(
         env: Env,
         proposer: Address,
         amount: i128,
@@ -1897,6 +1874,7 @@ impl FamilyWallet {
                     address: item.address.clone(),
                     role: item.role,
                     spending_limit: 0,
+                    precision_limit: PrecisionLimitOpt::None,
                     added_at: timestamp,
                 },
             );
@@ -2093,6 +2071,11 @@ impl FamilyWallet {
             ) => {
                 if require_auth {
                     proposer.require_auth();
+                }
+                if let Err(e) =
+                    Self::validate_precision_spending_internal(env.clone(), proposer.clone(), *amount)
+                {
+                    panic_with_error!(env, e);
                 }
                 Self::record_precision_spending(env, proposer, *amount);
                 let token_client = TokenClient::new(env, token);
@@ -2331,9 +2314,6 @@ impl FamilyWallet {
             .set(&symbol_short!("STOR_STAT"), &stats);
     }
 
-    fn validate_precision_spending(_env: Env, _member: Address, _amount: i128) -> Result<(), Error> {
-        Ok(())
-    }
 }
 
 #[cfg(test)]

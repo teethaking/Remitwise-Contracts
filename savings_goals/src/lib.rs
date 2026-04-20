@@ -7,6 +7,7 @@ use soroban_sdk::{
 use remitwise_common::{EventCategory, EventPriority, RemitwiseEvents};
 
 // Event topics
+const GOAL_CREATED: Symbol = symbol_short!("created");
 const GOAL_COMPLETED: Symbol = symbol_short!("completed");
 
 #[derive(Clone)]
@@ -544,6 +545,10 @@ impl SavingsGoalContract {
             symbol_short!("tags_add"),
             (goal_id, caller.clone(), tags.clone()),
         );
+        env.events().publish(
+            (symbol_short!("savings"), symbol_short!("tags_add")),
+            (goal_id, caller.clone(), tags.clone()),
+        );
 
         Self::append_audit(&env, symbol_short!("add_tags"), &caller, true);
     }
@@ -611,6 +616,10 @@ impl SavingsGoalContract {
             EventCategory::State,
             EventPriority::Medium,
             symbol_short!("tags_rem"),
+            (goal_id, caller.clone(), tags.clone()),
+        );
+        env.events().publish(
+            (symbol_short!("savings"), symbol_short!("tags_rem")),
             (goal_id, caller.clone(), tags.clone()),
         );
 
@@ -690,6 +699,11 @@ impl SavingsGoalContract {
             target_date,
             timestamp: env.ledger().timestamp(),
         };
+        env.events().publish((GOAL_CREATED,), event.clone());
+        env.events().publish(
+            (symbol_short!("savings"), SavingsEvent::GoalCreated),
+            next_id,
+        );
         RemitwiseEvents::emit(
             &env,
             EventCategory::State,
@@ -1304,7 +1318,6 @@ impl SavingsGoalContract {
         snapshot: GoalsExportSnapshot,
     ) -> Result<bool, SavingsGoalError> {
         caller.require_auth();
-        Self::require_nonce(&env, &caller, nonce);
 
         // Accept any schema_version within the supported range for backward/forward compat.
         if snapshot.schema_version < MIN_SUPPORTED_SCHEMA_VERSION
@@ -1322,6 +1335,8 @@ impl SavingsGoalContract {
             Self::append_audit(&env, symbol_short!("import"), &caller, false);
             return Err(SavingsGoalError::ChecksumMismatch);
         }
+
+        Self::require_nonce(&env, &caller, nonce);
 
         Self::extend_instance_ttl(&env);
         let mut goals: Map<u32, SavingsGoal> = Map::new(&env);

@@ -25,24 +25,6 @@ pub struct SplitInitializedEvent {
     pub timestamp: u64,
 }
 
-/// Domain-separated authorization payload for `initialize_split`.
-/// Passed to `require_auth_for_args` to bind the authorization to the
-/// specific operation parameters, preventing replay across different calls.
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[contracttype]
-pub struct SplitAuthPayload {
-    pub domain_id: Symbol,
-    pub network_id: BytesN<32>,
-    pub contract_addr: Address,
-    pub owner_addr: Address,
-    pub nonce_val: u64,
-    pub usdc_contract: Address,
-    pub spending_percent: u32,
-    pub savings_percent: u32,
-    pub bills_percent: u32,
-    pub insurance_percent: u32,
-}
-
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -66,6 +48,7 @@ pub enum RemittanceSplitError {
     ChecksumMismatch = 9,
     InvalidDueDate = 10,
     ScheduleNotFound = 11,
+    InactiveSchedule = 21,
     /// The supplied token contract address does not match the trusted USDC contract.
     UntrustedTokenContract = 12,
     /// A destination account is the same as the sender, which would be a no-op transfer.
@@ -81,20 +64,6 @@ pub enum RemittanceSplitError {
     PercentageOutOfRange = 17,
 }
 
-#[contracttype]
-pub struct SplitAuthPayload {
-    pub domain_id: Symbol,
-    pub network_id: BytesN<32>,
-    pub contract_addr: Address,
-    pub owner_addr: Address,
-    pub nonce_val: u64,
-    pub usdc_contract: Address,
-    pub spending_percent: u32,
-    pub savings_percent: u32,
-    pub bills_percent: u32,
-    pub insurance_percent: u32,
-}
-
 #[derive(Clone)]
 #[contracttype]
 pub struct AccountGroup {
@@ -102,21 +71,6 @@ pub struct AccountGroup {
     pub savings: Address,
     pub bills: Address,
     pub insurance: Address,
-}
-
-#[derive(Clone)]
-#[contracttype]
-pub struct SplitAuthPayload {
-    pub domain_id: Symbol,
-    pub network_id: BytesN<32>,
-    pub contract_addr: Address,
-    pub owner_addr: Address,
-    pub nonce_val: u64,
-    pub usdc_contract: Address,
-    pub spending_percent: u32,
-    pub savings_percent: u32,
-    pub bills_percent: u32,
-    pub insurance_percent: u32,
 }
 
 // Storage TTL constants
@@ -192,21 +146,6 @@ pub struct ExportSnapshot {
     pub exported_at: u64,
 }
 
-#[contracttype]
-#[derive(Clone)]
-pub struct SplitAuthPayload {
-    pub domain_id: Symbol,
-    pub network_id: BytesN<32>,
-    pub contract_addr: Address,
-    pub owner_addr: Address,
-    pub nonce_val: u64,
-    pub usdc_contract: Address,
-    pub spending_percent: u32,
-    pub savings_percent: u32,
-    pub bills_percent: u32,
-    pub insurance_percent: u32,
-}
-
 /// Audit log entry for security and compliance.
 #[contracttype]
 #[derive(Clone)]
@@ -230,6 +169,14 @@ pub struct AuditPage {
     pub next_cursor: u32,
     /// Number of items returned in this page.
     pub count: u32,
+}
+
+/// Split allocation output item for UI/analytics consumers.
+#[contracttype]
+#[derive(Clone)]
+pub struct Allocation {
+    pub category: Symbol,
+    pub amount: i128,
 }
 
 /// Schedule for automatic remittance splits
@@ -263,20 +210,7 @@ pub enum ScheduleEvent {
 ///
 /// Includes the full set of initialization parameters so that the
 /// signer commits to the exact configuration being applied.
-#[contracttype]
-#[derive(Clone)]
-pub struct SplitAuthPayload {
-    pub domain_id: Symbol,
-    pub network_id: BytesN<32>,
-    pub contract_addr: Address,
-    pub owner_addr: Address,
-    pub nonce_val: u64,
-    pub usdc_contract: Address,
-    pub spending_percent: u32,
-    pub savings_percent: u32,
-    pub bills_percent: u32,
-    pub insurance_percent: u32,
-}
+// NOTE: `SplitAuthPayload` is defined below with a stable schema.
 
 /// Current snapshot schema version. Bumped to 2 for FNV-1a checksum + exported_at field.
 const SCHEMA_VERSION: u32 = 2;
@@ -311,13 +245,6 @@ pub struct SplitAuthPayload {
     pub insurance_percent: u32,
 }
 
-fn clamp_limit(limit: u32) -> u32 {
-    if limit == 0 || limit > MAX_PAGE_LIMIT {
-        MAX_PAGE_LIMIT
-    } else {
-        limit
-    }
-}
 const MAX_AUDIT_ENTRIES: u32 = 100;
 const CONTRACT_VERSION: u32 = 1;
 
@@ -1126,7 +1053,7 @@ impl RemittanceSplit {
             + snapshot.config.insurance_percent;
         if total != 100 {
             Self::append_audit(&env, symbol_short!("import"), &caller, false);
-            return Err(e);
+            return Err(RemittanceSplitError::PercentagesDoNotSumTo100);
         }
 
         // 6. Timestamp sanity — reject payloads whose timestamps are in the future.

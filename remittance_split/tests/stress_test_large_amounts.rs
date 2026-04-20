@@ -262,6 +262,8 @@ fn test_schedule_id_sequencing_monotonicity() {
     let owner = <Address as AddressTrait>::generate(&env);
     env.mock_all_auths();
 
+    init(&client, &env, &owner, 50, 30, 15, 5);
+
     let amount = 1000_i128;
     let next_due = env.ledger().timestamp() + 86400;
     let interval = 86400;
@@ -281,6 +283,8 @@ fn test_schedule_id_uniqueness_across_operations() {
     let client = RemittanceSplitClient::new(&env, &contract_id);
     let owner = <Address as AddressTrait>::generate(&env);
     env.mock_all_auths();
+
+    init(&client, &env, &owner, 50, 30, 15, 5);
 
     let amount = 1000_i128;
     let next_due = env.ledger().timestamp() + 86400;
@@ -320,6 +324,8 @@ fn test_high_volume_schedule_creation_no_collisions() {
     let client = RemittanceSplitClient::new(&env, &contract_id);
     let owner = <Address as AddressTrait>::generate(&env);
     env.mock_all_auths();
+
+    init(&client, &env, &owner, 50, 30, 15, 5);
 
     let amount = 1000_i128;
     let next_due = env.ledger().timestamp() + 86400;

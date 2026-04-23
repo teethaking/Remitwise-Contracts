@@ -1849,6 +1849,6 @@ impl SavingsGoalContract {
 // Tests
 // -----------------------------------------------------------------------
 #[cfg(test)]
-mod test;
-#[cfg(test)]
 mod event_test;
+#[cfg(test)]
+mod test;

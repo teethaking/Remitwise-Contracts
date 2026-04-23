@@ -106,11 +106,11 @@ fn contract_policy_page_ordering_and_cursor_correctness() {
     let owner = Address::generate(&env);
 
     let name = String::from_str(&env, "ContractPolicy");
-    let coverage_type = String::from_str(&env, "health");
+    let coverage_type = CoverageType::Health;
 
     let mut created_ids = std::vec::Vec::new();
     for _ in 0..6 {
-        let id = client.create_policy(&owner, &name, &coverage_type, &120i128, &12_000i128);
+        let id = client.create_policy(&owner, &name, &coverage_type, &120i128, &12_000i128, &None);
         created_ids.push(id);
     }
 
@@ -144,7 +144,10 @@ fn contract_policy_page_ordering_and_cursor_correctness() {
             break;
         }
 
-        assert!(page.count > 0, "non-terminal pages must contain at least one item");
+        assert!(
+            page.count > 0,
+            "non-terminal pages must contain at least one item"
+        );
         let last_index = page.count - 1;
         let last_policy_id = page.items.get(last_index).unwrap().id;
         assert_eq!(

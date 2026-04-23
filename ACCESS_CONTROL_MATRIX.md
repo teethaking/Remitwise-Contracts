@@ -11,8 +11,7 @@ This document provides a comprehensive access-control matrix mapping each public
 | Public Method | Required Caller | Access Control Details |
 |--------------|-----------------|------------------------|
 | `create_bill` | Owner | Owner must authorize (`owner.require_auth()`). Validates amount > 0. |
-| `pay_bill` | Owner | Owner must authorize. Must own the bill. Bill must not be paid. |
-| `get_bill` | Anyone | No auth required. Returns Option<Bill>. |
+| `pay_bill` | Owner | Owner must authorize. Must own the bill. Bill must not be paid. || `set_external_ref` | Owner | Owner-only update/clear for bill external_ref. || `get_bill` | Anyone | No auth required. Returns Option<Bill>. |
 | `get_unpaid_bills` | Anyone | No auth required. Paginated query filtered by owner. |
 | `get_all_bills_for_owner` | Owner | Owner must authorize. Returns all bills (paid + unpaid). |
 | `get_overdue_bills` | Anyone | No auth. Returns unpaid bills past due date. |
@@ -122,6 +121,8 @@ This document provides a comprehensive access-control matrix mapping each public
 | `withdraw_from_goal` | Owner | Owner must authorize. Must not be locked. |
 | `lock_goal` | Owner | Owner only. Locks goal for withdrawal. |
 | `unlock_goal` | Owner | Owner only. Unlocks goal. |
+| `add_tags_to_goal` | Owner | Owner must authorize. Adds tags to goal. |
+| `remove_tags_from_goal` | Owner | Owner must authorize. Removes tags from goal. |
 | `get_goal` | Anyone | No auth. Returns goal if exists. |
 | `get_goals` | Anyone | No auth. Paginated query by owner. |
 | `get_all_goals` | Anyone | No auth. Legacy function. |
@@ -240,7 +241,7 @@ This document provides a comprehensive access-control matrix mapping each public
 | `execute_insurance_payment` | Caller | Caller must authorize. Validates spending limit. |
 | `execute_remittance_flow` | Caller | Caller must authorize. Full remittance flow with all validations. |
 | `get_execution_stats` | Anyone | No auth. Returns execution statistics. |
-| `get_audit_log` | Anyone | No auth. Returns audit entries. |
+| `get_audit_log` | Anyone | No auth. Returns audit entries with pagination (from_index, limit). |
 
 ### Cross-Contract Call Constraints
 

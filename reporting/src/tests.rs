@@ -219,7 +219,7 @@ mod family_wallet {
     #[contractimpl]
     impl FamilyWallet {
         pub fn get_owner(env: Env) -> Address {
-            Address::from_contract_id(&env, &env.current_contract_address())
+            env.current_contract_address()
         }
     }
 }
@@ -447,7 +447,7 @@ fn test_verify_dependency_address_set_rejects_self_reference() {
         savings_goals: Address::generate(&env),
         bill_payments: Address::generate(&env),
         insurance: Address::generate(&env),
-        family_wallet: Address::from_contract_id(&env, &contract_id),
+        family_wallet: contract_id.clone(),
     };
     let result = client.try_verify_dependency_address_set(&addrs);
     assert!(matches!(
@@ -2229,11 +2229,11 @@ fn test_check_dependencies_succeeds_with_configured_contracts() {
 
     client.configure_addresses(
         &admin,
-        &Address::from_contract_id(&env, &remittance_split_id),
-        &Address::from_contract_id(&env, &savings_goals_id),
-        &Address::from_contract_id(&env, &bill_payments_id),
-        &Address::from_contract_id(&env, &insurance_id),
-        &Address::from_contract_id(&env, &family_wallet_id),
+        &remittance_split_id,
+        &savings_goals_id,
+        &bill_payments_id,
+        &insurance_id,
+        &family_wallet_id,
     );
 
     let statuses = client.check_dependencies(&admin).unwrap();

@@ -578,7 +578,7 @@ impl ReportingContract {
 
         // Check savings_goals
         let savings_client = SavingsGoalsClient::new(&env, &addresses.savings_goals);
-        let savings_ok = match savings_client.try_get_all_goals(&Address::from_contract_id(&env, &env.current_contract_address())) {
+        let savings_ok = match savings_client.try_get_all_goals(&env.current_contract_address()) {
             Ok(Ok(_)) => true,
             _ => false,
         };
@@ -590,7 +590,7 @@ impl ReportingContract {
 
         // Check bill_payments
         let bill_client = BillPaymentsClient::new(&env, &addresses.bill_payments);
-        let bill_ok = match bill_client.try_get_total_unpaid(&Address::from_contract_id(&env, &env.current_contract_address())) {
+        let bill_ok = match bill_client.try_get_total_unpaid(&env.current_contract_address()) {
             Ok(Ok(_)) => true,
             _ => false,
         };
@@ -602,7 +602,7 @@ impl ReportingContract {
 
         // Check insurance
         let insurance_client = InsuranceClient::new(&env, &addresses.insurance);
-        let insurance_ok = match insurance_client.try_get_total_monthly_premium(&Address::from_contract_id(&env, &env.current_contract_address())) {
+        let insurance_ok = match insurance_client.try_get_total_monthly_premium(&env.current_contract_address()) {
             Ok(Ok(_)) => true,
             _ => false,
         };

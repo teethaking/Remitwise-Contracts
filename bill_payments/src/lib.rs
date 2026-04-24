@@ -67,6 +67,7 @@ pub mod pause_functions {
 }
 
 const STORAGE_UNPAID_TOTALS: Symbol = symbol_short!("UNPD_TOT");
+const ARCH_IDX_KEY: Symbol = symbol_short!("ARCH_IDX");
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -1110,6 +1111,82 @@ impl BillPayments {
         }
     }
 
+    /// Returns a page of archived bills for `owner` using the `ARCH_IDX` per-owner index.
+    ///
+    /// # Parameters
+    /// - `owner`: The address whose archived bills are queried.
+    /// - `cursor`: Exclusive lower bound on bill ID. Pass `0` to start from the beginning.
+    ///   The next page starts after the last returned ID (use `next_cursor` from the previous page).
+    /// - `limit`: Maximum items to return per page. `0` defaults to `DEFAULT_PAGE_LIMIT` (20).
+    ///   Values above `MAX_PAGE_LIMIT` (50) are clamped to `MAX_PAGE_LIMIT`.
+    ///
+    /// # Returns
+    /// `ArchivedBillPage` with:
+    /// - `items`: Up to `clamp_limit(limit)` archived bills in strictly ascending bill ID order.
+    /// - `next_cursor`: ID of the last item on this page if more pages exist; `0` if this is the last page.
+    /// - `count`: Number of items in `items`.
+    ///
+    /// # Ordering
+    /// Items are returned in strictly ascending bill ID order, matching the order maintained in `ARCH_IDX`.
+    ///
+    /// # Gas Complexity
+    /// O(clamp_limit(limit)) `ARCH_BILL` map lookups regardless of total archive size, because
+    /// only the owner's index entry is read rather than scanning the full `ARCH_BILL` map.
+    pub fn get_archived_bills_page(
+        env: Env,
+        owner: Address,
+        cursor: u32,
+        limit: u32,
+    ) -> ArchivedBillPage {
+        let effective_limit = clamp_limit(limit);
+        let archived: Map<u32, ArchivedBill> = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("ARCH_BILL"))
+            .unwrap_or_else(|| Map::new(&env));
+
+        let ids = Self::get_owner_index(&env, &owner);
+        let mut items: Vec<ArchivedBill> = Vec::new(&env);
+
+        for id in ids.iter() {
+            if id <= cursor {
+                continue;
+            }
+            if let Some(bill) = archived.get(id) {
+                items.push_back(bill);
+            }
+            if items.len() > effective_limit {
+                break;
+            }
+        }
+
+        let has_next = items.len() > effective_limit;
+        let mut next_cursor: u32 = 0;
+
+        if has_next {
+            // next_cursor = last item on the current page (before truncation)
+            let last_idx = effective_limit - 1;
+            if let Some(bill) = items.get(last_idx) {
+                next_cursor = bill.id;
+            }
+            // Truncate to effective_limit
+            let mut truncated: Vec<ArchivedBill> = Vec::new(&env);
+            for i in 0..effective_limit {
+                if let Some(bill) = items.get(i) {
+                    truncated.push_back(bill);
+                }
+            }
+            items = truncated;
+        }
+
+        let count = items.len();
+        ArchivedBillPage {
+            items,
+            next_cursor,
+            count,
+        }
+    }
+
     pub fn get_archived_bill(env: Env, bill_id: u32) -> Option<ArchivedBill> {
         let archived: Map<u32, ArchivedBill> = env
             .storage()
@@ -1200,6 +1277,9 @@ impl BillPayments {
                         currency: bill.currency.clone(),
                     };
                     archived.set(id, archived_bill);
+                    let mut owner_ids = Self::get_owner_index(&env, &bill.owner);
+                    owner_ids.push_back(id);
+                    Self::set_owner_index(&env, &bill.owner, owner_ids);
                     to_remove.push_back(id);
                     archived_count += 1;
                 }
@@ -1231,67 +1311,77 @@ impl BillPayments {
     }
 
     pub fn restore_bill(env: Env, caller: Address, bill_id: u32) -> Result<(), BillPaymentsError> {
-        caller.require_auth();
-        Self::require_not_paused(&env, pause_functions::RESTORE)?;
-        Self::extend_instance_ttl(&env);
+            caller.require_auth();
+            Self::require_not_paused(&env, pause_functions::RESTORE)?;
+            Self::extend_instance_ttl(&env);
 
-        let mut archived: Map<u32, ArchivedBill> = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("ARCH_BILL"))
-            .unwrap_or_else(|| Map::new(&env));
-        let archived_bill = archived
-            .get(bill_id)
-            .ok_or(BillPaymentsError::BillNotFound)?;
+            let mut archived: Map<u32, ArchivedBill> = env
+                .storage()
+                .instance()
+                .get(&symbol_short!("ARCH_BILL"))
+                .unwrap_or_else(|| Map::new(&env));
+            let archived_bill = archived
+                .get(bill_id)
+                .ok_or(BillPaymentsError::BillNotFound)?;
 
-        if archived_bill.owner != caller {
-            return Err(BillPaymentsError::Unauthorized);
+            if archived_bill.owner != caller {
+                return Err(BillPaymentsError::Unauthorized);
+            }
+
+            let mut bills: Map<u32, Bill> = env
+                .storage()
+                .instance()
+                .get(&symbol_short!("BILLS"))
+                .unwrap_or_else(|| Map::new(&env));
+
+            let restored_bill = Bill {
+                id: archived_bill.id,
+                owner: archived_bill.owner.clone(),
+                name: archived_bill.name.clone(),
+                external_ref: archived_bill.external_ref.clone(),
+                amount: archived_bill.amount,
+                due_date: env.ledger().timestamp() + 2592000,
+                recurring: false,
+                frequency_days: 0,
+                paid: true,
+                created_at: archived_bill.paid_at,
+                paid_at: Some(archived_bill.paid_at),
+                schedule_id: None,
+                tags: archived_bill.tags.clone(),
+                currency: archived_bill.currency.clone(),
+            };
+
+            bills.set(bill_id, restored_bill);
+            archived.remove(bill_id);
+
+            // Remove from ARCH_IDX
+            let old_ids = Self::get_owner_index(&env, &archived_bill.owner);
+            let mut new_ids: Vec<u32> = Vec::new(&env);
+            for eid in old_ids.iter() {
+                if eid != bill_id {
+                    new_ids.push_back(eid);
+                }
+            }
+            Self::set_owner_index(&env, &archived_bill.owner, new_ids);
+
+            env.storage()
+                .instance()
+                .set(&symbol_short!("BILLS"), &bills);
+            env.storage()
+                .instance()
+                .set(&symbol_short!("ARCH_BILL"), &archived);
+
+            Self::update_storage_stats(&env);
+
+            RemitwiseEvents::emit(
+                &env,
+                EventCategory::State,
+                EventPriority::Medium,
+                symbol_short!("restored"),
+                bill_id,
+            );
+            Ok(())
         }
-
-        let mut bills: Map<u32, Bill> = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("BILLS"))
-            .unwrap_or_else(|| Map::new(&env));
-
-        let restored_bill = Bill {
-            id: archived_bill.id,
-            owner: archived_bill.owner.clone(),
-            name: archived_bill.name.clone(),
-            external_ref: archived_bill.external_ref.clone(),
-            amount: archived_bill.amount,
-            due_date: env.ledger().timestamp() + 2592000,
-            recurring: false,
-            frequency_days: 0,
-            paid: true,
-            created_at: archived_bill.paid_at,
-            paid_at: Some(archived_bill.paid_at),
-            schedule_id: None,
-            tags: archived_bill.tags.clone(),
-            currency: archived_bill.currency.clone(),
-        };
-
-        bills.set(bill_id, restored_bill);
-        archived.remove(bill_id);
-
-        env.storage()
-            .instance()
-            .set(&symbol_short!("BILLS"), &bills);
-        env.storage()
-            .instance()
-            .set(&symbol_short!("ARCH_BILL"), &archived);
-
-        Self::update_storage_stats(&env);
-
-        RemitwiseEvents::emit(
-            &env,
-            EventCategory::State,
-            EventPriority::Medium,
-            symbol_short!("restored"),
-            bill_id,
-        );
-        Ok(())
-    }
 
     /// @notice Permanently delete archived bills with `archived_at < before_timestamp`.
     /// @dev Permissionless maintenance operation for archive compaction.
@@ -1314,17 +1404,26 @@ impl BillPayments {
             .get(&symbol_short!("ARCH_BILL"))
             .unwrap_or_else(|| Map::new(&env));
         let mut deleted_count = 0u32;
-        let mut to_remove: Vec<u32> = Vec::new(&env);
+        let mut to_remove: Vec<(u32, Address)> = Vec::new(&env);
 
         for (id, bill) in archived.iter() {
             if bill.archived_at < before_timestamp {
-                to_remove.push_back(id);
+                to_remove.push_back((id, bill.owner.clone()));
                 deleted_count += 1;
             }
         }
 
-        for id in to_remove.iter() {
+        for (id, owner) in to_remove.iter() {
             archived.remove(id);
+            // Remove from ARCH_IDX
+            let old_ids = Self::get_owner_index(&env, &owner);
+            let mut new_ids: Vec<u32> = Vec::new(&env);
+            for eid in old_ids.iter() {
+                if eid != id {
+                    new_ids.push_back(eid);
+                }
+            }
+            Self::set_owner_index(&env, &owner, new_ids);
         }
 
         env.storage()
@@ -1744,6 +1843,28 @@ impl BillPayments {
     }
     fn get_unpaid_totals_map(env: &Env) -> Option<Map<Address, i128>> {
         env.storage().instance().get(&STORAGE_UNPAID_TOTALS)
+    }
+
+    /// Read the owner's archived bill ID list from ARCH_IDX.
+    /// Returns an empty Vec if no entry exists for this owner.
+    fn get_owner_index(env: &Env, owner: &Address) -> Vec<u32> {
+        let idx: Map<Address, Vec<u32>> = env
+            .storage()
+            .instance()
+            .get(&ARCH_IDX_KEY)
+            .unwrap_or_else(|| Map::new(env));
+        idx.get(owner.clone()).unwrap_or_else(|| Vec::new(env))
+    }
+
+    /// Persist the owner's archived bill ID list back to ARCH_IDX.
+    fn set_owner_index(env: &Env, owner: &Address, ids: Vec<u32>) {
+        let mut idx: Map<Address, Vec<u32>> = env
+            .storage()
+            .instance()
+            .get(&ARCH_IDX_KEY)
+            .unwrap_or_else(|| Map::new(env));
+        idx.set(owner.clone(), ids);
+        env.storage().instance().set(&ARCH_IDX_KEY, &idx);
     }
 
     fn adjust_unpaid_total(env: &Env, owner: &Address, delta: i128) {

@@ -30,6 +30,9 @@ const MAX_BATCH_MEMBERS: u32 = 50;
 
 // Access audit bounds
 const MAX_ACCESS_AUDIT_ENTRIES: u32 = 200;
+const MAX_AUDIT_PAGE_LIMIT: u32 = 50;
+const DEFAULT_AUDIT_PAGE_LIMIT: u32 = 20;
+
 #[contracttype]
 #[derive(Clone)]
 pub struct AccessAuditEntry {
@@ -38,6 +41,14 @@ pub struct AccessAuditEntry {
     pub target: Option<Address>,
     pub success: bool,
     pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct AccessAuditPage {
+    pub items: Vec<AccessAuditEntry>,
+    pub next_cursor: u32,
+    pub count: u32,
 }
 
 #[contracttype]
@@ -1941,6 +1952,46 @@ impl FamilyWallet {
             }
         }
         out
+    }
+
+    // Owner/Admin only: audit data is privacy-sensitive — reveals who accessed
+    // what and when, so Members are excluded from reading the full trail.
+    pub fn get_access_audit_page(
+        env: Env,
+        caller: Address,
+        from_index: u32,
+        limit: u32,
+    ) -> AccessAuditPage {
+        caller.require_auth();
+        Self::require_role_at_least(&env, &caller, FamilyRole::Admin);
+
+        let entries: Vec<AccessAuditEntry> = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("ACC_AUDIT"))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let capped_limit = if limit == 0 {
+            DEFAULT_AUDIT_PAGE_LIMIT
+        } else {
+            limit.min(MAX_AUDIT_PAGE_LIMIT)
+        };
+        let total = entries.len();
+        let mut items = Vec::new(&env);
+        let mut i = from_index;
+        while i < total && items.len() < capped_limit {
+            if let Some(e) = entries.get(i) {
+                items.push_back(e);
+            }
+            i += 1;
+        }
+        let count = items.len();
+        let next_cursor = if i < total { i } else { 0 };
+        AccessAuditPage {
+            items,
+            next_cursor,
+            count,
+        }
     }
 
     // -----------------------------------------------------------------------

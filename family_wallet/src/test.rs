@@ -2609,3 +2609,177 @@ fn test_disabled_rollover_only_checks_single_tx_limits() {
     let result = client.try_withdraw(&member, &token_contract.address(), &recipient, &500_0000000);
     assert!(result.is_err());
 }
+
+// ---------------------------------------------------------------------------
+// get_access_audit_page tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_audit_page_owner_can_read_first_page() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = FamilyWalletClient::new(&env, &env.register_contract(None, FamilyWallet));
+    let owner = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let member = Address::generate(&env);
+    client.init(&owner, &Vec::new(&env));
+    client.add_member(&owner, &admin, &FamilyRole::Admin, &0i128);
+    client.add_member(&owner, &member, &FamilyRole::Member, &0i128);
+
+    client.set_emergency_mode(&owner, &true);
+    let page = client.get_access_audit_page(&owner, &0, &10);
+    assert!(page.count > 0);
+    assert_eq!(page.next_cursor, 0);
+}
+
+#[test]
+fn test_audit_page_admin_can_read() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = FamilyWalletClient::new(&env, &env.register_contract(None, FamilyWallet));
+    let owner = Address::generate(&env);
+    let admin = Address::generate(&env);
+    client.init(&owner, &Vec::new(&env));
+    client.add_member(&owner, &admin, &FamilyRole::Admin, &0i128);
+
+    client.set_emergency_mode(&owner, &true);
+    let page = client.get_access_audit_page(&admin, &0, &10);
+    assert!(page.count > 0);
+}
+
+#[test]
+#[should_panic]
+fn test_audit_page_member_denied() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = FamilyWalletClient::new(&env, &env.register_contract(None, FamilyWallet));
+    let owner = Address::generate(&env);
+    let member = Address::generate(&env);
+    client.init(&owner, &Vec::new(&env));
+    client.add_member(&owner, &member, &FamilyRole::Member, &0i128);
+
+    client.set_emergency_mode(&owner, &true);
+    client.get_access_audit_page(&member, &0, &10);
+}
+
+#[test]
+fn test_audit_page_cursor_progression() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.budget().reset_unlimited();
+    let client = FamilyWalletClient::new(&env, &env.register_contract(None, FamilyWallet));
+    let owner = Address::generate(&env);
+    client.init(&owner, &Vec::new(&env));
+
+    for _ in 0..10 {
+        client.set_emergency_mode(&owner, &true);
+        client.set_emergency_mode(&owner, &false);
+    }
+    // 20 entries; fetch in pages of 7
+    let page1 = client.get_access_audit_page(&owner, &0, &7);
+    assert_eq!(page1.count, 7);
+    assert_ne!(page1.next_cursor, 0);
+
+    let page2 = client.get_access_audit_page(&owner, &page1.next_cursor, &7);
+    assert_eq!(page2.count, 7);
+    assert_ne!(page2.next_cursor, 0);
+
+    assert!(page2.next_cursor > page1.next_cursor);
+
+    let page3 = client.get_access_audit_page(&owner, &page2.next_cursor, &7);
+    assert_eq!(page3.count, 6);
+    assert_eq!(page3.next_cursor, 0);
+}
+
+#[test]
+fn test_audit_page_terminates_at_cursor_zero() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = FamilyWalletClient::new(&env, &env.register_contract(None, FamilyWallet));
+    let owner = Address::generate(&env);
+    client.init(&owner, &Vec::new(&env));
+    client.set_emergency_mode(&owner, &true);
+
+    let mut cursor = 0u32;
+    let mut iterations = 0u32;
+    loop {
+        let page = client.get_access_audit_page(&owner, &cursor, &DEFAULT_AUDIT_PAGE_LIMIT);
+        iterations += 1;
+        if page.next_cursor == 0 {
+            break;
+        }
+        cursor = page.next_cursor;
+        assert!(iterations < 100, "paging loop did not terminate");
+    }
+    assert!(iterations >= 1);
+}
+
+#[test]
+fn test_audit_page_limit_capped_at_max() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.budget().reset_unlimited();
+    let client = FamilyWalletClient::new(&env, &env.register_contract(None, FamilyWallet));
+    let owner = Address::generate(&env);
+    client.init(&owner, &Vec::new(&env));
+
+    for _ in 0..60 {
+        client.set_emergency_mode(&owner, &true);
+        client.set_emergency_mode(&owner, &false);
+    }
+    let page = client.get_access_audit_page(&owner, &0, &200);
+    assert!(page.count <= MAX_AUDIT_PAGE_LIMIT);
+}
+
+#[test]
+fn test_audit_page_zero_limit_uses_default() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.budget().reset_unlimited();
+    let client = FamilyWalletClient::new(&env, &env.register_contract(None, FamilyWallet));
+    let owner = Address::generate(&env);
+    client.init(&owner, &Vec::new(&env));
+
+    for _ in 0..25 {
+        client.set_emergency_mode(&owner, &true);
+    }
+    let page = client.get_access_audit_page(&owner, &0, &0);
+    assert_eq!(page.count, DEFAULT_AUDIT_PAGE_LIMIT);
+}
+
+#[test]
+fn test_audit_page_out_of_bounds_returns_empty() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = FamilyWalletClient::new(&env, &env.register_contract(None, FamilyWallet));
+    let owner = Address::generate(&env);
+    client.init(&owner, &Vec::new(&env));
+
+    let page = client.get_access_audit_page(&owner, &1000, &10);
+    assert_eq!(page.count, 0);
+    assert_eq!(page.next_cursor, 0);
+}
+
+#[test]
+fn test_audit_page_items_match_get_access_audit() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = FamilyWalletClient::new(&env, &env.register_contract(None, FamilyWallet));
+    let owner = Address::generate(&env);
+    client.init(&owner, &Vec::new(&env));
+
+    client.set_emergency_mode(&owner, &true);
+    client.set_emergency_mode(&owner, &false);
+
+    let all = client.get_access_audit(&200);
+    let page = client.get_access_audit_page(&owner, &0, &200);
+
+    assert_eq!(page.count, all.len());
+    for i in 0..page.count {
+        let a = all.get(i).unwrap();
+        let b = page.items.get(i).unwrap();
+        assert_eq!(a.operation, b.operation);
+        assert_eq!(a.caller, b.caller);
+        assert_eq!(a.success, b.success);
+    }
+}

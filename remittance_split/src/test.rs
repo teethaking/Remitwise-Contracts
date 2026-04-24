@@ -4,7 +4,7 @@ use super::*;
 use soroban_sdk::{
     testutils::{Address as AddressTrait, Events},
     token::StellarAssetClient,
-    Address, Env, IntoVal, Symbol, TryFromVal,
+    Address, Env, Symbol, TryFromVal,
 };
 
 #[test]
@@ -70,16 +70,14 @@ fn test_distribution_completed_event() {
     let (_contract_id, topics, data) = last_event;
 
     // Verify topic schema
-    assert_eq!(
-        topics.get(0).unwrap(),
-        symbol_short!("Remitwise").into_val(&env)
-    );
-    assert_eq!(topics.get(1).unwrap(), (0u32).into_val(&env)); // Category: Transaction
-    assert_eq!(topics.get(2).unwrap(), (1u32).into_val(&env)); // Priority: Medium
-    assert_eq!(
-        topics.get(3).unwrap(),
-        symbol_short!("dist_comp").into_val(&env)
-    );
+    let topic0 = Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap();
+    let topic1 = u32::try_from_val(&env, &topics.get(1).unwrap()).unwrap();
+    let topic2 = u32::try_from_val(&env, &topics.get(2).unwrap()).unwrap();
+    let topic3 = Symbol::try_from_val(&env, &topics.get(3).unwrap()).unwrap();
+    assert_eq!(topic0, symbol_short!("Remitwise"));
+    assert_eq!(topic1, 0);
+    assert_eq!(topic2, 1);
+    assert_eq!(topic3, symbol_short!("dist_comp"));
 
     // Verify structured payload
     let event: DistributionCompletedEvent = DistributionCompletedEvent::try_from_val(&env, &data)
@@ -144,15 +142,24 @@ fn test_distribution_event_topic_correctness() {
         .iter()
         .find(|e| {
             let topics = &e.1;
-            topics.len() == 4 && topics.get(3).unwrap() == symbol_short!("dist_comp").into_val(&env)
+            if topics.len() != 4 {
+                return false;
+            }
+            let namespace = Symbol::try_from_val(&env, &topics.get(0).unwrap());
+            let action = Symbol::try_from_val(&env, &topics.get(3).unwrap());
+            matches!(
+                (namespace, action),
+                (Ok(ns), Ok(act))
+                    if ns == symbol_short!("Remitwise") && act == symbol_short!("dist_comp")
+            )
         })
         .expect("DistributionCompleted event not found");
 
     let topics = &dist_comp_event.1;
-    assert_eq!(
-        topics.get(0).unwrap(),
-        symbol_short!("Remitwise").into_val(&env)
-    );
-    assert_eq!(topics.get(1).unwrap(), (0u32).into_val(&env)); // Transaction
-    assert_eq!(topics.get(2).unwrap(), (1u32).into_val(&env)); // Medium
+    let topic0 = Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap();
+    let topic1 = u32::try_from_val(&env, &topics.get(1).unwrap()).unwrap();
+    let topic2 = u32::try_from_val(&env, &topics.get(2).unwrap()).unwrap();
+    assert_eq!(topic0, symbol_short!("Remitwise"));
+    assert_eq!(topic1, 0);
+    assert_eq!(topic2, 1);
 }

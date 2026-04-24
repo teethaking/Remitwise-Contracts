@@ -64,6 +64,10 @@ pub enum RemittanceSplitError {
     PercentageOutOfRange = 17,
     /// The owner has reached the maximum number of allowed schedules.
     ScheduleCapExceeded = 22,
+    /// The schedule interval is below the minimum allowed value.
+    ScheduleIntervalTooShort = 23,
+    /// The schedule lead time exceeds the maximum allowed value.
+    ScheduleLeadTimeTooLong = 24,
 }
 
 #[derive(Clone)]
@@ -83,7 +87,13 @@ const MAX_USED_NONCES_PER_ADDR: u32 = 256;
 /// Maximum ledger seconds a signed request may remain valid after creation.
 const MAX_DEADLINE_WINDOW_SECS: u64 = 3600; // 1 hour
 /// Maximum number of remittance schedules allowed per owner to prevent storage bloat.
-const MAX_SCHEDULES_PER_OWNER: u32 = 50;
+pub const MAX_SCHEDULES_PER_OWNER: u32 = 50;
+/// Minimum allowed recurrence interval for repeating schedules (1 hour in seconds).
+/// One-off schedules (interval == 0) are exempt from this check.
+pub const MIN_SCHEDULE_INTERVAL: u64 = 3_600;
+/// Maximum allowed lead time for schedule due dates (1 year in seconds).
+/// Prevents unrealistic far-future scheduling that creates operational risk.
+pub const MAX_SCHEDULE_LEAD_TIME: u64 = 365 * 24 * 3_600;
 
 /// Split configuration with owner tracking for access control
 #[derive(Clone)]
@@ -166,6 +176,14 @@ pub struct AuditEntry {
     pub caller: Address,
     pub timestamp: u64,
     pub success: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct AuditPage {
+    pub items: Vec<AuditEntry>,
+    pub next_cursor: u32,
+    pub count: u32,
 }
 
 /// Paginated result for schedule queries.
@@ -1123,6 +1141,19 @@ impl RemittanceSplit {
             return Err(RemittanceSplitError::ScheduleCapExceeded);
         }
 
+        for schedule in snapshot.schedules.iter() {
+            if schedule.active {
+                if schedule.interval > 0 && schedule.interval < MIN_SCHEDULE_INTERVAL {
+                    Self::append_audit(&env, symbol_short!("import"), &caller, false);
+                    return Err(RemittanceSplitError::ScheduleIntervalTooShort);
+                }
+                if schedule.next_due.saturating_sub(current_time) > MAX_SCHEDULE_LEAD_TIME {
+                    Self::append_audit(&env, symbol_short!("import"), &caller, false);
+                    return Err(RemittanceSplitError::ScheduleLeadTimeTooLong);
+                }
+            }
+        }
+
         Self::extend_instance_ttl(&env);
         env.storage()
             .instance()
@@ -1155,8 +1186,6 @@ impl RemittanceSplit {
         for schedule in snapshot.schedules.iter() {
             owner_ids.push_back(schedule.id);
         }
-        // Ensure deterministic ordering for consistent query results
-        owner_ids.sort_unstable();
         env.storage()
             .persistent()
             .set(&DataKey::OwnerSchedules(caller.clone()), &owner_ids);
@@ -1615,13 +1644,21 @@ impl RemittanceSplit {
             return Err(RemittanceSplitError::InvalidDueDate);
         }
 
+        if interval > 0 && interval < MIN_SCHEDULE_INTERVAL {
+            return Err(RemittanceSplitError::ScheduleIntervalTooShort);
+        }
+
+        if next_due.saturating_sub(current_time) > MAX_SCHEDULE_LEAD_TIME {
+            return Err(RemittanceSplitError::ScheduleLeadTimeTooLong);
+        }
+
         // Check schedule cap before creating new schedule
         let owner_schedules: Vec<u32> = env
             .storage()
             .persistent()
             .get(&DataKey::OwnerSchedules(owner.clone()))
             .unwrap_or_else(|| Vec::new(&env));
-        
+
         if owner_schedules.len() >= MAX_SCHEDULES_PER_OWNER as u32 {
             return Err(RemittanceSplitError::ScheduleCapExceeded);
         }
@@ -1675,8 +1712,6 @@ impl RemittanceSplit {
             .get(&DataKey::OwnerSchedules(owner.clone()))
             .unwrap_or_else(|| Vec::new(&env));
         owner_schedules.push_back(next_schedule_id);
-        // Ensure deterministic ordering for consistent query results
-        owner_schedules.sort_unstable();
         env.storage()
             .persistent()
             .set(&DataKey::OwnerSchedules(owner.clone()), &owner_schedules);
@@ -1743,6 +1778,14 @@ impl RemittanceSplit {
         let current_time = env.ledger().timestamp();
         if next_due <= current_time {
             return Err(RemittanceSplitError::InvalidDueDate);
+        }
+
+        if interval > 0 && interval < MIN_SCHEDULE_INTERVAL {
+            return Err(RemittanceSplitError::ScheduleIntervalTooShort);
+        }
+
+        if next_due.saturating_sub(current_time) > MAX_SCHEDULE_LEAD_TIME {
+            return Err(RemittanceSplitError::ScheduleLeadTimeTooLong);
         }
 
         let mut schedule: RemittanceSchedule = env
@@ -1838,15 +1881,11 @@ impl RemittanceSplit {
     }
 
     pub fn get_remittance_schedules(env: Env, owner: Address) -> Vec<RemittanceSchedule> {
-        let mut schedule_ids: Vec<u32> = env
+        let schedule_ids: Vec<u32> = env
             .storage()
             .persistent()
             .get(&DataKey::OwnerSchedules(owner.clone()))
             .unwrap_or_else(|| Vec::new(&env));
-
-        // Ensure deterministic ordering by sorting IDs ascending
-        // This guarantees consistent results regardless of storage order
-        schedule_ids.sort_unstable();
 
         let mut result = Vec::new(&env);
         for id in schedule_ids.iter() {
@@ -1883,21 +1922,17 @@ impl RemittanceSplit {
     /// - `limit` is clamped to prevent excessive gas usage
     /// - Out-of-range `from_index` returns empty page safely
     /// - Cancelled schedules are included (they remain in storage for audit)
-    pub fn get_remittance_schedules_paginated(
+    pub fn get_remittance_schedules_page(
         env: Env,
         owner: Address,
         from_index: u32,
         limit: u32,
     ) -> SchedulePage {
-        let mut schedule_ids: Vec<u32> = env
+        let schedule_ids: Vec<u32> = env
             .storage()
             .persistent()
             .get(&DataKey::OwnerSchedules(owner.clone()))
             .unwrap_or_else(|| Vec::new(&env));
-
-        // Ensure deterministic ordering by sorting IDs ascending
-        // This guarantees stable pagination even if storage order changes
-        schedule_ids.sort_unstable();
 
         let len = schedule_ids.len();
         let cap = clamp_limit(limit);

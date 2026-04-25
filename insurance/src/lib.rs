@@ -219,7 +219,7 @@ impl Insurance {
             id: next_id,
             owner: owner.clone(),
             name,
-            external_ref,
+            external_ref: external_ref.clone(),
             coverage_type,
             monthly_premium,
             coverage_amount,
@@ -302,6 +302,206 @@ impl Insurance {
         }
 
         Ok(true)
+    }
+
+    pub fn set_external_ref(
+        env: Env,
+        caller: Address,
+        policy_id: u32,
+        external_ref: Option<String>,
+    ) -> bool {
+        caller.require_auth();
+        Self::extend_instance_ttl(&env);
+
+        if let Some(ref_value) = external_ref.clone() {
+            Self::validate_external_ref(&ref_value);
+        }
+
+        let mut policies: Map<u32, InsurancePolicy> = env
+            .storage()
+            .instance()
+            .get(&KEY_POLICIES)
+            .unwrap_or_else(|| Map::new(&env));
+        let mut policy = match policies.get(policy_id) {
+            Some(p) => p,
+            None => return false,
+        };
+
+        if policy.owner != caller {
+            return false;
+        }
+
+        let old_external_ref = policy.external_ref.clone();
+
+        if external_ref == old_external_ref {
+            return true;
+        }
+
+        if let Some(new_ref) = external_ref.clone() {
+            Self::ensure_external_ref_available(&env, &policy.owner, &new_ref, Some(policy_id));
+        }
+
+        Self::unbind_external_ref(&env, &policy.owner, policy_id, &old_external_ref);
+        Self::bind_external_ref(&env, &policy.owner, policy_id, &external_ref);
+
+        policy.external_ref = external_ref.clone();
+        policies.set(policy_id, policy);
+        env.storage().instance().set(&KEY_POLICIES, &policies);
+
+        env.events().publish(
+            (EVENT_EXTERNAL_REF_UPDATED,),
+            ExternalRefUpdatedEvent {
+                policy_id,
+                owner: caller,
+                external_ref,
+            },
+        );
+
+        true
+    }
+
+    pub fn archive_policy(env: Env, caller: Address, policy_id: u32) -> bool {
+        caller.require_auth();
+        Self::extend_instance_ttl(&env);
+
+        let mut policies: Map<u32, InsurancePolicy> = env
+            .storage()
+            .instance()
+            .get(&KEY_POLICIES)
+            .unwrap_or_else(|| Map::new(&env));
+        let mut archived: Map<u32, ArchivedPolicy> = env
+            .storage()
+            .instance()
+            .get(&KEY_ARCHIVED_POLICIES)
+            .unwrap_or_else(|| Map::new(&env));
+
+        let policy = match policies.get(policy_id) {
+            Some(p) => p,
+            None => return false,
+        };
+        if policy.owner != caller {
+            return false;
+        }
+
+        Self::unbind_external_ref(&env, &policy.owner, policy_id, &policy.external_ref);
+
+        archived.set(
+            policy_id,
+            ArchivedPolicy {
+                id: policy.id,
+                owner: policy.owner,
+                name: policy.name,
+                external_ref: policy.external_ref,
+                coverage_type: policy.coverage_type,
+                monthly_premium: policy.monthly_premium,
+                coverage_amount: policy.coverage_amount,
+                next_payment_date: policy.next_payment_date,
+            },
+        );
+        policies.remove(policy_id);
+
+        env.storage().instance().set(&KEY_POLICIES, &policies);
+        env.storage()
+            .instance()
+            .set(&KEY_ARCHIVED_POLICIES, &archived);
+        true
+    }
+
+    pub fn restore_policy(env: Env, caller: Address, policy_id: u32) -> bool {
+        caller.require_auth();
+        Self::extend_instance_ttl(&env);
+
+        let mut policies: Map<u32, InsurancePolicy> = env
+            .storage()
+            .instance()
+            .get(&KEY_POLICIES)
+            .unwrap_or_else(|| Map::new(&env));
+        let mut archived: Map<u32, ArchivedPolicy> = env
+            .storage()
+            .instance()
+            .get(&KEY_ARCHIVED_POLICIES)
+            .unwrap_or_else(|| Map::new(&env));
+
+        let archived_policy = match archived.get(policy_id) {
+            Some(p) => p,
+            None => return false,
+        };
+        if archived_policy.owner != caller {
+            return false;
+        }
+
+        if let Some(ref_value) = archived_policy.external_ref.clone() {
+            let index = Self::get_external_ref_index(&env);
+            if let Some(existing_id) = index.get((archived_policy.owner.clone(), ref_value)) {
+                if existing_id != policy_id {
+                    return false;
+                }
+            }
+        }
+
+        Self::bind_external_ref(
+            &env,
+            &archived_policy.owner,
+            policy_id,
+            &archived_policy.external_ref,
+        );
+
+        policies.set(
+            policy_id,
+            InsurancePolicy {
+                id: archived_policy.id,
+                owner: archived_policy.owner,
+                name: archived_policy.name,
+                external_ref: archived_policy.external_ref,
+                coverage_type: archived_policy.coverage_type,
+                monthly_premium: archived_policy.monthly_premium,
+                coverage_amount: archived_policy.coverage_amount,
+                active: true,
+                next_payment_date: archived_policy.next_payment_date,
+            },
+        );
+        archived.remove(policy_id);
+
+        env.storage().instance().set(&KEY_POLICIES, &policies);
+        env.storage()
+            .instance()
+            .set(&KEY_ARCHIVED_POLICIES, &archived);
+        true
+    }
+
+    pub fn get_archived_policy(env: Env, policy_id: u32) -> Option<ArchivedPolicy> {
+        Self::extend_instance_ttl(&env);
+        let archived: Map<u32, ArchivedPolicy> = env
+            .storage()
+            .instance()
+            .get(&KEY_ARCHIVED_POLICIES)
+            .unwrap_or_else(|| Map::new(&env));
+        archived.get(policy_id)
+    }
+
+    pub fn get_policy_id_by_external_ref(
+        env: Env,
+        owner: Address,
+        external_ref: String,
+    ) -> Option<u32> {
+        Self::extend_instance_ttl(&env);
+
+        let len = external_ref.len();
+        if len == 0 || len > MAX_EXTERNAL_REF_LEN {
+            return None;
+        }
+        let copy_len = len as usize;
+        let mut buf = [0u8; MAX_EXTERNAL_REF_LEN as usize];
+        external_ref.copy_into_slice(&mut buf[..copy_len]);
+        if !buf[..copy_len]
+            .iter()
+            .all(|&b| Self::is_allowed_external_ref_byte(b))
+        {
+            return None;
+        }
+
+        let index = Self::get_external_ref_index(&env);
+        index.get((owner, external_ref))
     }
 
     pub fn pay_premium(env: Env, caller: Address, policy_id: u32) -> bool {
@@ -625,5 +825,196 @@ impl Insurance {
         policies.set(policy_id, policy);
         env.storage().instance().set(&KEY_POLICIES, &policies);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Insurance, InsuranceClient};
+    use remitwise_common::CoverageType;
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::{Address, Env, String};
+
+    fn setup() -> (Env, InsuranceClient<'static>, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, Insurance);
+        let client = InsuranceClient::new(&env, &contract_id);
+        let owner_a = Address::generate(&env);
+        let owner_b = Address::generate(&env);
+        (env, client, owner_a, owner_b)
+    }
+
+    fn policy_name(env: &Env) -> String {
+        String::from_str(env, "Policy")
+    }
+
+    fn ext(env: &Env, v: &str) -> Option<String> {
+        Some(String::from_str(env, v))
+    }
+
+    #[test]
+    #[should_panic(expected = "external_ref already in use for owner")]
+    fn duplicate_external_ref_same_owner_panics() {
+        let (env, client, owner, _) = setup();
+        let name = policy_name(&env);
+        client.create_policy(
+            &owner,
+            &name,
+            &CoverageType::Health,
+            &100,
+            &10_000,
+            &ext(&env, "INV-001"),
+        );
+        client.create_policy(
+            &owner,
+            &name,
+            &CoverageType::Life,
+            &200,
+            &20_000,
+            &ext(&env, "INV-001"),
+        );
+    }
+
+    #[test]
+    fn duplicate_external_ref_different_owners_allowed() {
+        let (env, client, owner_a, owner_b) = setup();
+        let name = policy_name(&env);
+
+        let id_a = client.create_policy(
+            &owner_a,
+            &name,
+            &CoverageType::Health,
+            &100,
+            &10_000,
+            &ext(&env, "INV-001"),
+        );
+        let id_b = client.create_policy(
+            &owner_b,
+            &name,
+            &CoverageType::Health,
+            &100,
+            &10_000,
+            &ext(&env, "INV-001"),
+        );
+
+        assert_eq!(
+            client.get_policy_id_by_external_ref(&owner_a, &String::from_str(&env, "INV-001")),
+            Some(id_a)
+        );
+        assert_eq!(
+            client.get_policy_id_by_external_ref(&owner_b, &String::from_str(&env, "INV-001")),
+            Some(id_b)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid external_ref charset")]
+    fn invalid_external_ref_charset_panics() {
+        let (env, client, owner, _) = setup();
+        let name = policy_name(&env);
+        client.create_policy(
+            &owner,
+            &name,
+            &CoverageType::Health,
+            &100,
+            &10_000,
+            &ext(&env, "bad ref"),
+        );
+    }
+
+    #[test]
+    fn clearing_external_ref_allows_reuse() {
+        let (env, client, owner, _) = setup();
+        let name = policy_name(&env);
+
+        let id1 = client.create_policy(
+            &owner,
+            &name,
+            &CoverageType::Health,
+            &100,
+            &10_000,
+            &ext(&env, "INV-002"),
+        );
+
+        assert!(client.set_external_ref(&owner, &id1, &None));
+        assert_eq!(
+            client.get_policy_id_by_external_ref(&owner, &String::from_str(&env, "INV-002")),
+            None
+        );
+
+        let id2 = client.create_policy(
+            &owner,
+            &name,
+            &CoverageType::Life,
+            &100,
+            &10_000,
+            &ext(&env, "INV-002"),
+        );
+        assert_eq!(
+            client.get_policy_id_by_external_ref(&owner, &String::from_str(&env, "INV-002")),
+            Some(id2)
+        );
+    }
+
+    #[test]
+    fn deactivate_clears_external_ref_mapping_allows_reuse() {
+        let (env, client, owner, _) = setup();
+        let name = policy_name(&env);
+
+        let id1 = client.create_policy(
+            &owner,
+            &name,
+            &CoverageType::Health,
+            &100,
+            &10_000,
+            &ext(&env, "INV-003"),
+        );
+        assert!(client.deactivate_policy(&owner, &id1));
+
+        let id2 = client.create_policy(
+            &owner,
+            &name,
+            &CoverageType::Property,
+            &100,
+            &10_000,
+            &ext(&env, "INV-003"),
+        );
+        assert_eq!(
+            client.get_policy_id_by_external_ref(&owner, &String::from_str(&env, "INV-003")),
+            Some(id2)
+        );
+    }
+
+    #[test]
+    fn restore_with_conflicting_external_ref_fails_closed() {
+        let (env, client, owner, _) = setup();
+        let name = policy_name(&env);
+
+        let id1 = client.create_policy(
+            &owner,
+            &name,
+            &CoverageType::Health,
+            &100,
+            &10_000,
+            &ext(&env, "INV-004"),
+        );
+        assert!(client.archive_policy(&owner, &id1));
+
+        let id2 = client.create_policy(
+            &owner,
+            &name,
+            &CoverageType::Auto,
+            &120,
+            &12_000,
+            &ext(&env, "INV-004"),
+        );
+
+        assert!(!client.restore_policy(&owner, &id1));
+        assert_eq!(
+            client.get_policy_id_by_external_ref(&owner, &String::from_str(&env, "INV-004")),
+            Some(id2)
+        );
+        assert!(client.get_archived_policy(&id1).is_some());
     }
 }

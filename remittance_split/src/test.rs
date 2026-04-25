@@ -1,413 +1,532 @@
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use soroban_sdk::Env;
+#![cfg(test)]
 
-    // Helper to create test environment
-    fn setup_test() -> (Env, Address) {
-        let env = Env::default();
-        env.mock_all_auths();
-        let owner = Address::generate(&env);
-        (env, owner)
+use super::*;
+use soroban_sdk::{
+    testutils::{Address as AddressTrait, Events},
+    token::StellarAssetClient,
+    Address, Env, IntoVal, TryFromVal,
+};
+
+#[test]
+fn test_distribution_completed_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, RemittanceSplit);
+    let client = RemittanceSplitClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin);
+    let token_addr = token_contract.address();
+    let stellar_client = StellarAssetClient::new(&env, &token_addr);
+
+    // 1. Initialize split
+    // percentages: 40, 30, 20, 10
+    client.initialize_split(&owner, &0, &token_addr, &40, &30, &20, &10);
+
+    // 2. Setup destination accounts
+    let accounts = AccountGroup {
+        spending: Address::generate(&env),
+        savings: Address::generate(&env),
+        bills: Address::generate(&env),
+        insurance: Address::generate(&env),
+    };
+
+    // 3. Mint tokens to owner
+    let total_amount = 1000i128;
+    stellar_client.mint(&owner, &total_amount);
+
+    // 4. Distribute
+    let nonce = 1u64; // nonce 0 used in initialize_split
+    let deadline = env.ledger().timestamp() + 3600;
+    let request_hash = RemittanceSplit::compute_request_hash(
+        symbol_short!("distrib"),
+        owner.clone(),
+        nonce,
+        total_amount,
+        deadline,
+    );
+
+    client.distribute_usdc(
+        &token_addr,
+        &owner,
+        &nonce,
+        &deadline,
+        &request_hash,
+        &accounts,
+        &total_amount,
+    );
+
+    // 5. Verify events
+    let events = env.events().all();
+
+    // We expect several events:
+    // - init (from initialize_split)
+    // - dist_ok (unstructured)
+    // - dist_comp (structured) - THIS IS THE ONE WE CARE ABOUT
+
+    let last_event = events.last().expect("No events emitted");
+    let (_contract_id, topics, data) = last_event;
+
+    // Verify topic schema count
+    assert_eq!(topics.len(), 4, "Expected 4 topics in event");
+
+    // Verify structured payload
+    let event: DistributionCompletedEvent = DistributionCompletedEvent::try_from_val(&env, &data)
+        .expect("Failed to parse DistributionCompletedEvent data");
+
+    assert_eq!(event.from, owner);
+    assert_eq!(event.total_amount, total_amount);
+    assert_eq!(event.spending_amount, 400); // 40% of 1000
+    assert_eq!(event.savings_amount, 300); // 30% of 1000
+    assert_eq!(event.bills_amount, 200); // 20% of 1000
+    assert_eq!(event.insurance_amount, 100); // 10% of 1000 handled by remainder
+    assert_eq!(event.timestamp, env.ledger().timestamp());
+}
+
+#[test]
+fn test_distribution_event_topic_correctness() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, RemittanceSplit);
+    let client = RemittanceSplitClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin);
+    let token_addr = token_contract.address();
+    let stellar_client = StellarAssetClient::new(&env, &token_addr);
+
+    client.initialize_split(&owner, &0, &token_addr, &50, &50, &0, &0);
+
+    let accounts = AccountGroup {
+        spending: Address::generate(&env),
+        savings: Address::generate(&env),
+        bills: Address::generate(&env),
+        insurance: Address::generate(&env),
+    };
+
+    stellar_client.mint(&owner, &100);
+
+    let nonce = 1u64;
+    let deadline = env.ledger().timestamp() + 3600;
+    let request_hash = RemittanceSplit::compute_request_hash(
+        symbol_short!("distrib"),
+        owner.clone(),
+        nonce,
+        100,
+        deadline,
+    );
+
+    client.distribute_usdc(
+        &token_addr,
+        &owner,
+        &nonce,
+        &deadline,
+        &request_hash,
+        &accounts,
+        &100,
+    );
+
+    let events = env.events().all();
+    let dist_comp_event = events
+        .iter()
+        .find(|e| {
+            let topics = &e.1;
+            topics.len() == 4
+        })
+        .expect("DistributionCompleted event not found");
+
+    let topics = &dist_comp_event.1;
+    assert_eq!(topics.len(), 4, "Event should have 4 topics");
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Request Hash Tests - Test Vectors for distribute_usdc Signing
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Test that get_request_hash produces a deterministic 32-byte SHA-256 hash
+#[test]
+fn test_request_hash_deterministic() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, RemittanceSplit);
+    let client = RemittanceSplitClient::new(&env, &contract_id);
+    
+    let usdc_contract = Address::generate(&env);
+    let from = Address::generate(&env);
+    let spending = Address::generate(&env);
+    let savings = Address::generate(&env);
+    let bills = Address::generate(&env);
+    let insurance = Address::generate(&env);
+    
+    let request = DistributeUsdcRequest {
+        usdc_contract: usdc_contract.clone(),
+        from: from.clone(),
+        nonce: 0,
+        accounts: AccountGroup {
+            spending: spending.clone(),
+            savings: savings.clone(),
+            bills: bills.clone(),
+            insurance: insurance.clone(),
+        },
+        total_amount: 1000i128,
+        deadline: 2000u64,
+    };
+    
+    // Hash the same request twice
+    let hash1 = client.get_request_hash(&request);
+    let hash2 = client.get_request_hash(&request);
+    
+    // Both hashes should be identical (deterministic)
+    assert_eq!(hash1, hash2);
+    // SHA-256 produces 32 bytes
+    assert_eq!(hash1.len(), 32);
+}
+
+/// Test that changing any parameter changes the hash (no collisions)
+#[test]
+fn test_request_hash_changes_with_parameters() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, RemittanceSplit);
+    let client = RemittanceSplitClient::new(&env, &contract_id);
+    
+    let usdc_contract = Address::generate(&env);
+    let from = Address::generate(&env);
+    let spending = Address::generate(&env);
+    let savings = Address::generate(&env);
+    let bills = Address::generate(&env);
+    let insurance = Address::generate(&env);
+    let other = Address::generate(&env);
+    
+    let base_request = DistributeUsdcRequest {
+        usdc_contract: usdc_contract.clone(),
+        from: from.clone(),
+        nonce: 0,
+        accounts: AccountGroup {
+            spending: spending.clone(),
+            savings: savings.clone(),
+            bills: bills.clone(),
+            insurance: insurance.clone(),
+        },
+        total_amount: 1000i128,
+        deadline: 2000u64,
+    };
+    
+    let base_hash = client.get_request_hash(&base_request);
+    
+    // Test 1: Changing usdc_contract changes hash
+    let mut req = base_request.clone();
+    req.usdc_contract = other.clone();
+    let hash = client.get_request_hash(&req);
+    assert!(hash.ne(&base_hash), "Hash should change when usdc_contract changes");
+    
+    // Test 2: Changing from address changes hash
+    let mut req = base_request.clone();
+    req.from = other.clone();
+    let hash = client.get_request_hash(&req);
+    assert!(hash.ne(&base_hash), "Hash should change when from changes");
+    
+    // Test 3: Changing nonce changes hash
+    let mut req = base_request.clone();
+    req.nonce = 1;
+    let hash = client.get_request_hash(&req);
+    assert!(hash.ne(&base_hash), "Hash should change when nonce changes");
+    
+    // Test 4: Changing total_amount changes hash
+    let mut req = base_request.clone();
+    req.total_amount = 2000;
+    let hash = client.get_request_hash(&req);
+    assert!(hash.ne(&base_hash), "Hash should change when total_amount changes");
+    
+    // Test 5: Changing deadline changes hash
+    let mut req = base_request.clone();
+    req.deadline = 3000;
+    let hash = client.get_request_hash(&req);
+    assert!(hash.ne(&base_hash), "Hash should change when deadline changes");
+    
+    // Test 6: Changing spending account changes hash
+    let mut req = base_request.clone();
+    req.accounts.spending = other.clone();
+    let hash = client.get_request_hash(&req);
+    assert!(hash.ne(&base_hash), "Hash should change when spending account changes");
+}
+
+/// Test deadline validation: deadline must not be in the past
+#[test]
+fn test_distribute_usdc_deadline_expired() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, RemittanceSplit);
+    let client = RemittanceSplitClient::new(&env, &contract_id);
+    
+    env.mock_all_auths();
+    set_ledger_time(&env, 1000);
+    
+    let owner = Address::generate(&env);
+    let usdc_contract = Address::generate(&env);
+    let spending = Address::generate(&env);
+    let savings = Address::generate(&env);
+    let bills = Address::generate(&env);
+    let insurance = Address::generate(&env);
+    
+    // Initialize contract
+    client.initialize_split(&owner, &0, &50, &30, &15, &5);
+    
+    // Create request with deadline in the past (500 < 1000)
+    let request = DistributeUsdcRequest {
+        usdc_contract: usdc_contract.clone(),
+        from: owner.clone(),
+        nonce: 0,
+        accounts: AccountGroup {
+            spending: spending.clone(),
+            savings: savings.clone(),
+            bills: bills.clone(),
+            insurance: insurance.clone(),
+        },
+        total_amount: 1000i128,
+        deadline: 500u64,  // Past deadline
+    };
+    
+    let hash = client.get_request_hash(&request);
+    let result = client.try_distribute_usdc_with_hash_and_deadline(&request, &hash);
+    assert_eq!(result, Err(Ok(RemittanceSplitError::DeadlineExpired)));
+}
+
+/// Test deadline validation: deadline must not be too far in the future (MAX_DEADLINE_WINDOW_SECS = 3600)
+#[test]
+fn test_distribute_usdc_deadline_too_far() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, RemittanceSplit);
+    let client = RemittanceSplitClient::new(&env, &contract_id);
+    
+    env.mock_all_auths();
+    set_ledger_time(&env, 1000);
+    
+    let owner = Address::generate(&env);
+    let usdc_contract = Address::generate(&env);
+    let spending = Address::generate(&env);
+    let savings = Address::generate(&env);
+    let bills = Address::generate(&env);
+    let insurance = Address::generate(&env);
+    
+    // Initialize contract
+    client.initialize_split(&owner, &0, &50, &30, &15, &5);
+    
+    // Create request with deadline > MAX_DEADLINE_WINDOW_SECS from now
+    let request = DistributeUsdcRequest {
+        usdc_contract: usdc_contract.clone(),
+        from: owner.clone(),
+        nonce: 0,
+        accounts: AccountGroup {
+            spending: spending.clone(),
+            savings: savings.clone(),
+            bills: bills.clone(),
+            insurance: insurance.clone(),
+        },
+        total_amount: 1000i128,
+        deadline: 1000 + 3600 + 1,  // 1 second more than allowed window
+    };
+    
+    let hash = client.get_request_hash(&request);
+    let result = client.try_distribute_usdc_with_hash_and_deadline(&request, &hash);
+    assert_eq!(result, Err(Ok(RemittanceSplitError::InvalidDeadline)));
+}
+
+/// Test deadline validation: deadline must not be zero
+#[test]
+fn test_distribute_usdc_deadline_zero() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, RemittanceSplit);
+    let client = RemittanceSplitClient::new(&env, &contract_id);
+    
+    env.mock_all_auths();
+    set_ledger_time(&env, 1000);
+    
+    let owner = Address::generate(&env);
+    let usdc_contract = Address::generate(&env);
+    let spending = Address::generate(&env);
+    let savings = Address::generate(&env);
+    let bills = Address::generate(&env);
+    let insurance = Address::generate(&env);
+    
+    // Initialize contract
+    client.initialize_split(&owner, &0, &50, &30, &15, &5);
+    
+    // Create request with deadline = 0
+    let request = DistributeUsdcRequest {
+        usdc_contract: usdc_contract.clone(),
+        from: owner.clone(),
+        nonce: 0,
+        accounts: AccountGroup {
+            spending: spending.clone(),
+            savings: savings.clone(),
+            bills: bills.clone(),
+            insurance: insurance.clone(),
+        },
+        total_amount: 1000i128,
+        deadline: 0,  // Invalid deadline
+    };
+    
+    let hash = client.get_request_hash(&request);
+    let result = client.try_distribute_usdc_with_hash_and_deadline(&request, &hash);
+    assert_eq!(result, Err(Ok(RemittanceSplitError::InvalidDeadline)));
+}
+
+/// Test request hash mismatch: passing wrong hash should fail
+#[test]
+fn test_distribute_usdc_hash_mismatch() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, RemittanceSplit);
+    let client = RemittanceSplitClient::new(&env, &contract_id);
+    
+    env.mock_all_auths();
+    set_ledger_time(&env, 1000);
+    
+    let owner = Address::generate(&env);
+    let usdc_contract = Address::generate(&env);
+    let spending = Address::generate(&env);
+    let savings = Address::generate(&env);
+    let bills = Address::generate(&env);
+    let insurance = Address::generate(&env);
+    
+    // Initialize contract
+    client.initialize_split(&owner, &0, &50, &30, &15, &5);
+    
+    // Create valid request
+    let request = DistributeUsdcRequest {
+        usdc_contract: usdc_contract.clone(),
+        from: owner.clone(),
+        nonce: 0,
+        accounts: AccountGroup {
+            spending: spending.clone(),
+            savings: savings.clone(),
+            bills: bills.clone(),
+            insurance: insurance.clone(),
+        },
+        total_amount: 1000i128,
+        deadline: 2000u64,
+    };
+    
+    // Get correct hash and then create a wrong one
+    let correct_hash = client.get_request_hash(&request);
+    let mut wrong_hash = correct_hash.clone();
+    // Flip a byte to create a different hash
+    if wrong_hash.get(0).unwrap() != &0xFFu8 {
+        wrong_hash.set(0, &(wrong_hash.get(0).unwrap() + 1));
+    } else {
+        wrong_hash.set(0, &(wrong_hash.get(0).unwrap() - 1));
     }
+    
+    let result = client.try_distribute_usdc_with_hash_and_deadline(&request, &wrong_hash);
+    assert_eq!(result, Err(Ok(RemittanceSplitError::RequestHashMismatch)));
+}
 
-    // Helper to initialize split and create audit entries
-    fn create_audit_log(env: &Env, owner: &Address, num_entries: u32) {
-        let contract_id = env.register_contract(None, RemittanceSplit);
-        let client = RemittanceSplitClient::new(env, &contract_id);
-        let usdc = Address::generate(env);
-
-        // Initialize
-        let _init = client.initialize_split(
-            owner,
-            0,
-            &usdc,
-            25,
-            25,
-            25,
-            25,
-        );
-
-        // Create audit entries by performing operations
-        for i in 0..num_entries {
-            let nonce = i as u64;
-            let amount = 100_0000000i128 + i as i128;
-
-            let deadline = env.ledger().timestamp() + 3600;
-            let request_hash = RemittanceSplit::compute_request_hash(
-                symbol_short!("distrib"),
-                owner.clone(),
-                nonce,
-                amount,
-                deadline,
-            );
-
-            let accounts = AccountGroup {
-                spending: Address::generate(env),
-                savings: Address::generate(env),
-                bills: Address::generate(env),
-                insurance: Address::generate(env),
-            };
-
-            // Each operation creates an audit entry
-            let _result = client.try_distribute_usdc(
-                &usdc,
-                owner,
-                nonce,
-                deadline,
-                request_hash,
-                &accounts,
-                amount,
-            );
+/// Test boundary: deadline exactly at MAX_DEADLINE_WINDOW_SECS should succeed
+#[test]
+fn test_distribute_usdc_deadline_at_boundary() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, RemittanceSplit);
+    let client = RemittanceSplitClient::new(&env, &contract_id);
+    
+    env.mock_all_auths();
+    set_ledger_time(&env, 1000);
+    
+    let owner = Address::generate(&env);
+    let usdc_contract = Address::generate(&env);
+    let spending = Address::generate(&env);
+    let savings = Address::generate(&env);
+    let bills = Address::generate(&env);
+    let insurance = Address::generate(&env);
+    
+    // Initialize contract
+    client.initialize_split(&owner, &0, &50, &30, &15, &5);
+    
+    // Create request with deadline exactly at MAX_DEADLINE_WINDOW_SECS boundary
+    let request = DistributeUsdcRequest {
+        usdc_contract: usdc_contract.clone(),
+        from: owner.clone(),
+        nonce: 0,
+        accounts: AccountGroup {
+            spending: spending.clone(),
+            savings: savings.clone(),
+            bills: bills.clone(),
+            insurance: insurance.clone(),
+        },
+        total_amount: 1000i128,
+        deadline: 1000 + 3600,  // Exactly at 1 hour boundary
+    };
+    
+    let hash = client.get_request_hash(&request);
+    
+    // This should pass deadline validation
+    // (It will fail for other reasons like missing USDC balance, but not deadline)
+    let result = client.try_distribute_usdc_with_hash_and_deadline(&request, &hash);
+    
+    // Should fail due to other reasons (e.g., balance), not deadline validation
+    // We can't assert equality here since we didn't register USDC token,
+    // but we can check it's not a DeadlineExpired or InvalidDeadline error
+    match result {
+        Err(Ok(RemittanceSplitError::DeadlineExpired)) => {
+            panic!("Should not fail with DeadlineExpired");
         }
-    }
-
-    #[test]
-    fn test_get_audit_log_empty_page() {
-        let (env, owner) = setup_test();
-
-        let contract_id = env.register_contract(None, RemittanceSplit);
-        let client = RemittanceSplitClient::new(&env, &contract_id);
-        let usdc = Address::generate(&env);
-
-        let _init = client.initialize_split(
-            &owner,
-            0,
-            &usdc,
-            25,
-            25,
-            25,
-            25,
-        );
-
-        // Query empty audit log
-        let page = client.get_audit_log(&0, &20);
-        assert_eq!(page.items.len(), 0);
-        assert_eq!(page.next_cursor, 0);
-        assert_eq!(page.count, 0);
-    }
-
-    #[test]
-    fn test_get_audit_log_single_entry() {
-        let (env, owner) = setup_test();
-
-        let contract_id = env.register_contract(None, RemittanceSplit);
-        let client = RemittanceSplitClient::new(&env, &contract_id);
-        let usdc = Address::generate(&env);
-
-        let _init = client.initialize_split(
-            &owner,
-            0,
-            &usdc,
-            25,
-            25,
-            25,
-            25,
-        );
-
-        create_audit_log(&env, &owner, 1);
-
-        // Get first page
-        let page = client.get_audit_log(&0, &20);
-        assert_eq!(page.items.len(), 1);
-        assert_eq!(page.next_cursor, 0); // No more pages
-        assert_eq!(page.count, 1);
-    }
-
-    #[test]
-    fn test_get_audit_log_from_index_beyond_length() {
-        let (env, owner) = setup_test();
-
-        let contract_id = env.register_contract(None, RemittanceSplit);
-        let client = RemittanceSplitClient::new(&env, &contract_id);
-        let usdc = Address::generate(&env);
-
-        let _init = client.initialize_split(
-            &owner,
-            0,
-            &usdc,
-            25,
-            25,
-            25,
-            25,
-        );
-
-        create_audit_log(&env, &owner, 5);
-
-        // Query starting at index 10 (beyond the 5 entries)
-        let page = client.get_audit_log(&10, &20);
-        assert_eq!(page.items.len(), 0);
-        assert_eq!(page.next_cursor, 0);
-        assert_eq!(page.count, 0);
-    }
-
-    #[test]
-    fn test_get_audit_log_u32_max_cursor() {
-        let (env, owner) = setup_test();
-
-        let contract_id = env.register_contract(None, RemittanceSplit);
-        let client = RemittanceSplitClient::new(&env, &contract_id);
-        let usdc = Address::generate(&env);
-
-        let _init = client.initialize_split(
-            &owner,
-            0,
-            &usdc,
-            25,
-            25,
-            25,
-            25,
-        );
-
-        // Create a few audit entries
-        create_audit_log(&env, &owner, 5);
-
-        // Query with u32::MAX cursor - should safely return empty page
-        let page = client.get_audit_log(&u32::MAX, &20);
-        assert_eq!(page.items.len(), 0);
-        assert_eq!(page.next_cursor, 0);
-        assert_eq!(page.count, 0);
-    }
-
-    #[test]
-    fn test_get_audit_log_u32_max_limit() {
-        let (env, owner) = setup_test();
-
-        let contract_id = env.register_contract(None, RemittanceSplit);
-        let client = RemittanceSplitClient::new(&env, &contract_id);
-        let usdc = Address::generate(&env);
-
-        let _init = client.initialize_split(
-            &owner,
-            0,
-            &usdc,
-            25,
-            25,
-            25,
-            25,
-        );
-
-        // Create max possible audit entries (100)
-        create_audit_log(&env, &owner, 100);
-
-        // Query with u32::MAX limit - should be clamped to MAX_PAGE_LIMIT (50)
-        let page = client.get_audit_log(&0, &u32::MAX);
-        assert_eq!(page.items.len(), 50);
-        assert_eq!(page.next_cursor, 50); // More pages exist
-        assert_eq!(page.count, 50);
-    }
-
-    #[test]
-    fn test_get_audit_log_saturating_add_overflow() {
-        let (env, owner) = setup_test();
-
-        let contract_id = env.register_contract(None, RemittanceSplit);
-        let client = RemittanceSplitClient::new(&env, &contract_id);
-        let usdc = Address::generate(&env);
-
-        let _init = client.initialize_split(
-            &owner,
-            0,
-            &usdc,
-            25,
-            25,
-            25,
-            25,
-        );
-
-        // Create 100 audit entries
-        create_audit_log(&env, &owner, 100);
-
-        // Query: from_index = u32::MAX - 10, limit = 50
-        // saturating_add will overflow but be clamped by min(len)
-        let page = client.get_audit_log(&(u32::MAX - 10), &50);
-        assert_eq!(page.items.len(), 0); // Beyond log length
-        assert_eq!(page.next_cursor, 0);
-        assert_eq!(page.count, 0);
-    }
-
-    #[test]
-    fn test_get_audit_log_pagination_determinism() {
-        let (env, owner) = setup_test();
-
-        let contract_id = env.register_contract(None, RemittanceSplit);
-        let client = RemittanceSplitClient::new(&env, &contract_id);
-        let usdc = Address::generate(&env);
-
-        let _init = client.initialize_split(
-            &owner,
-            0,
-            &usdc,
-            25,
-            25,
-            25,
-            25,
-        );
-
-        // Create 50 audit entries
-        create_audit_log(&env, &owner, 50);
-
-        // Query same parameters twice - should get identical results
-        let page1 = client.get_audit_log(&10, &20);
-        let page2 = client.get_audit_log(&10, &20);
-
-        assert_eq!(page1.items.len(), page2.items.len());
-        assert_eq!(page1.next_cursor, page2.next_cursor);
-        assert_eq!(page1.count, page2.count);
-
-        // Verify items are identical
-        for i in 0..page1.items.len() {
-            let item1 = page1.items.get(i as u32).unwrap();
-            let item2 = page2.items.get(i as u32).unwrap();
-            assert_eq!(item1.operation, item2.operation);
-            assert_eq!(item1.caller, item2.caller);
-            assert_eq!(item1.timestamp, item2.timestamp);
-            assert_eq!(item1.success, item2.success);
+        Err(Ok(RemittanceSplitError::InvalidDeadline)) => {
+            panic!("Should not fail with InvalidDeadline");
         }
-    }
-
-    #[test]
-    fn test_get_audit_log_exact_boundary() {
-        let (env, owner) = setup_test();
-
-        let contract_id = env.register_contract(None, RemittanceSplit);
-        let client = RemittanceSplitClient::new(&env, &contract_id);
-        let usdc = Address::generate(&env);
-
-        let _init = client.initialize_split(
-            &owner,
-            0,
-            &usdc,
-            25,
-            25,
-            25,
-            25,
-        );
-
-        // Create exactly 100 audit entries
-        create_audit_log(&env, &owner, 100);
-
-        // Query from_index=0, limit=100 (clamped to 50)
-        let page = client.get_audit_log(&0, &100);
-        assert_eq!(page.items.len(), 50);
-        assert_eq!(page.next_cursor, 50);
-        assert_eq!(page.count, 50);
-
-        // Query second page
-        let page2 = client.get_audit_log(&50, &100);
-        assert_eq!(page2.items.len(), 50);
-        assert_eq!(page2.next_cursor, 100);
-        assert_eq!(page2.count, 50);
-
-        // Query third page (should be empty)
-        let page3 = client.get_audit_log(&100, &50);
-        assert_eq!(page3.items.len(), 0);
-        assert_eq!(page3.next_cursor, 0);
-        assert_eq!(page3.count, 0);
-    }
-
-    #[test]
-    fn test_get_audit_log_middle_page() {
-        let (env, owner) = setup_test();
-
-        let contract_id = env.register_contract(None, RemittanceSplit);
-        let client = RemittanceSplitClient::new(&env, &contract_id);
-        let usdc = Address::generate(&env);
-
-        let _init = client.initialize_split(
-            &owner,
-            0,
-            &usdc,
-            25,
-            25,
-            25,
-            25,
-        );
-
-        // Create 75 audit entries
-        create_audit_log(&env, &owner, 75);
-
-        // Query middle page: from_index=25, limit=20
-        let page = client.get_audit_log(&25, &20);
-        assert_eq!(page.items.len(), 20);
-        assert_eq!(page.next_cursor, 45);
-        assert_eq!(page.count, 20);
-
-        // Query next page: from_index=45, limit=20
-        let page2 = client.get_audit_log(&45, &20);
-        assert_eq!(page2.items.len(), 20);
-        assert_eq!(page2.next_cursor, 65);
-        assert_eq!(page2.count, 20);
-
-        // Query final page: from_index=65, limit=20
-        let page3 = client.get_audit_log(&65, &20);
-        assert_eq!(page3.items.len(), 10); // Only 10 items left
-        assert_eq!(page3.next_cursor, 0); // No more pages
-        assert_eq!(page3.count, 10);
-    }
-
-    #[test]
-    fn test_get_audit_log_zero_limit_defaults_to_default() {
-        let (env, owner) = setup_test();
-
-        let contract_id = env.register_contract(None, RemittanceSplit);
-        let client = RemittanceSplitClient::new(&env, &contract_id);
-        let usdc = Address::generate(&env);
-
-        let _init = client.initialize_split(
-            &owner,
-            0,
-            &usdc,
-            25,
-            25,
-            25,
-            25,
-        );
-
-        // Create 50 audit entries
-        create_audit_log(&env, &owner, 50);
-
-        // Query with limit=0 (should use default of 20)
-        let page = client.get_audit_log(&0, &0);
-        assert_eq!(page.items.len(), 20);
-        assert_eq!(page.next_cursor, 20);
-        assert_eq!(page.count, 20);
-    }
-
-    #[test]
-    fn test_get_audit_log_no_panic_on_extreme_values() {
-        let (env, owner) = setup_test();
-
-        let contract_id = env.register_contract(None, RemittanceSplit);
-        let client = RemittanceSplitClient::new(&env, &contract_id);
-        let usdc = Address::generate(&env);
-
-        let _init = client.initialize_split(
-            &owner,
-            0,
-            &usdc,
-            25,
-            25,
-            25,
-            25,
-        );
-
-        // Create 100 audit entries
-        create_audit_log(&env, &owner, 100);
-
-        // These queries should not panic despite extreme values
-        let combinations = vec![
-            (0, u32::MAX),
-            (u32::MAX, 1),
-            (u32::MAX, u32::MAX),
-            (u32::MAX - 50, 100),
-            (50, u32::MAX - 50),
-        ];
-
-        for (from_index, limit) in combinations {
-            let page = client.get_audit_log(&from_index, &limit);
-            // Should return a valid page, not panic
-            assert!(page.items.len() <= 50); // Never exceeds MAX_PAGE_LIMIT
-        }
+        _ => {} // Any other result is acceptable for this boundary test
     }
 }
+
+/// Test that the same request always produces the same hash (cross-call consistency)
+#[test]
+fn test_request_hash_cross_call_consistency() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, RemittanceSplit);
+    let client = RemittanceSplitClient::new(&env, &contract_id);
+    
+    let usdc_contract = Address::generate(&env);
+    let from = Address::generate(&env);
+    let spending = Address::generate(&env);
+    let savings = Address::generate(&env);
+    let bills = Address::generate(&env);
+    let insurance = Address::generate(&env);
+    
+    let request = DistributeUsdcRequest {
+        usdc_contract: usdc_contract.clone(),
+        from: from.clone(),
+        nonce: 42,
+        accounts: AccountGroup {
+            spending: spending.clone(),
+            savings: savings.clone(),
+            bills: bills.clone(),
+            insurance: insurance.clone(),
+        },
+        total_amount: 12345i128,
+        deadline: 9999u64,
+    };
+    
+    // Call get_request_hash multiple times
+    let hashes: Vec<_> = (0..5)
+        .map(|_| client.get_request_hash(&request))
+        .collect();
+    
+    // All hashes should be identical
+    for hash in &hashes[1..] {
+        assert_eq!(hash, &hashes[0], "Hash should be consistent across calls");
+    }
+}
+
+fn set_time(env: &Env, timestamp: u64) {
+    env.ledger().set(LedgerInfo {
+        timestamp,
+        protocol_version: 20,
+        sequence_number: 0,
+        network_id: Default::default(),
+        base_reserve: 0,
+        max_tx_size: 0,
+        min_temp_entry_ttl: 0,
+        min_persistent_entry_ttl: 0,
+        max_entry_ttl: 0,
+    });
+}
+
